@@ -24,7 +24,7 @@
           (emberlight game draw))
 
   (export core-boot! core-frame! core-keys core-sticks core-pad core-playtest core-updater
-          core-world core-set-seen! core-settings-table core-best
+          core-world core-set-seen! core-settings-table core-best core-touched!
           GAME-NAME VERSION)
 
   (begin
@@ -104,11 +104,19 @@
              (dy (clamp1 (+ (axis 'up 'down) (axis 'w 's) (pad-dir 'up 'down) (cdr st) (cdr ps)))))
         (list (round-2 dx) (round-2 dy) *start*)))
 
-    (define (start-asked?)
-      (or (keys-pressed? *keys* 'space) (keys-pressed? *keys* 'return)
-          (pad-pressed? *pad* 'a) (pad-pressed? *pad* 'start)
-          (let ((v (stick-vector *sticks* "move"))) (> (+ (abs (car v)) (abs (cdr v))) 0.6))))
+    ;; A start is a fresh press: Space, Enter, a pad's A or Start, or a touch
+    ;; landing on the page (core-touched!, from the web shell's pointerdown).
+    ;; Never the stick's position: a stick still held when a round ends would
+    ;; otherwise start the next one.
+    (define *touched* #f)
+    (define (core-touched!) (set! *touched* #t))
 
+    (define (start-asked?)
+      (let ((t *touched*))
+        (set! *touched* #f)
+        (or t
+            (keys-pressed? *keys* 'space) (keys-pressed? *keys* 'return)
+            (pad-pressed? *pad* 'a) (pad-pressed? *pad* 'start))))
     ;; --- the update line, in Emberlight's own words -------------------------------
 
     (define (update-line)
@@ -165,7 +173,7 @@
     (define (core-frame! dt win-w win-h integer-only)
       (set! *clock* (clock-advance *clock* dt))
       (if (playtest-busy? *pt*)
-          (keys-clear! *keys*)
+          (begin (keys-clear! *keys*) (set! *touched* #f))
           (begin
             (when (start-asked?) (set! *start* #t))
             (palette-key!)

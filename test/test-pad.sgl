@@ -57,3 +57,9 @@
     (let ((p (make-pad)))
       (pad-poll! p)
       (assert-false (pad-connected? p)))))
+
+(test-group "pad: the native's bytes"
+  (test "centre is exactly 0; the ends are -1 and 1; the buttons follow"
+    (let ((d (decode-read (bytevector 128 128 1 255 1 255 129 0))))
+      (assert-equal (list 0.0 0.0 -1.0 1.0 -1.0 1.0) (car d))
+      (assert-equal 129 (cdr d)))))

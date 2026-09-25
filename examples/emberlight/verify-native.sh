@@ -94,6 +94,7 @@ report() {
   echo "$REPORTS/$(ls "$REPORTS" | sort | tail -1)"
 }
 mx() { $JQ -r '.location.moth[0]' "$1/report.json"; }
+mxy() { $JQ -r '.location.moth | map(tostring) | join(",")' "$1/report.json"; }
 
 R1="$(report "first")" || fail report "no report.json"
 if [ -n "${R1:-}" ]; then
@@ -102,10 +103,12 @@ if [ -n "${R1:-}" ]; then
   [ "$phase" = "play" ] && pass "report phase (play)" || fail "report phase" "$phase"
   idn="$($IM identify -regard-warnings -format '%wx%h %[fx:mean]' "$R1/screenshot.png" 2>&1)"
   [ "${idn%% *}" = "768x432" ] && pass "screenshot 768x432, valid" || fail screenshot "identify: $idn"
-  awk "BEGIN { exit !(${idn##* } > 0.01) }" && pass "screenshot not blank (mean ${idn##* })" || fail screenshot "mean ${idn##* }"
+  # the share of pixels brighter than 20% grey: the dark fill alone is 0
+  lit="$($IM convert "$R1/screenshot.png" -colorspace gray -threshold 20% -format '%[fx:mean]' info: 2>&1)"
+  awk "BEGIN { exit !($lit > 0.002) }" && pass "screenshot not blank ($lit of pixels lit)" || fail screenshot "$lit of pixels lit"
   sleep 1
   R2="$(report "second")" || fail still "no second report"
-  [ -n "${R2:-}" ] && [ "$(mx "$R1")" = "$(mx "$R2")" ] && pass "still (no input, moth at x $(mx "$R1") both times)" || fail still "x $(mx "$R1") then $(mx "${R2:-$R1}")"
+  [ -n "${R2:-}" ] && [ "$(mxy "$R1")" = "$(mxy "$R2")" ] && pass "still (no input, moth at $(mxy "$R1") both times)" || fail still "$(mxy "$R1") then $(mxy "${R2:-$R1}")"
   $X windowfocus --sync "$XID" keydown d; sleep 1.5; $X keyup d
   sleep 1
   R3="$(report "third")" || fail move "no third report"
@@ -122,6 +125,7 @@ sleep 1
 $X windowfocus --sync "$XID" key Escape
 sleep 2
 [ "$(ls "$REPORTS" 2>/dev/null | wc -l)" -eq "$n" ] && pass "discard writes nothing" || fail discard "a report was written"
+grep -q "substratic: playtest discarded" "$WORK/game.log" && pass "discard closed the note (the game said so)" || fail discard "no discarded line"
 [ -n "$GAME_PID" ] && kill -0 "$GAME_PID" 2>/dev/null && pass "discard does not quit" || fail discard "the game is gone"
 
 $IM import -window "$XID" "$WORK/last.png" 2>/dev/null

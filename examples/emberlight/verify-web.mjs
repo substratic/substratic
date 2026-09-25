@@ -5,8 +5,11 @@
 //   page       the icons are served; every URL parameter reaches the game
 //   update     version.json is fetched and the "new" line comes up for a
 //              player who last saw an older version (?seen=0.0.9)
+//   tap        a tap on the title starts round 1
 //   gamepad    a scripted gamepad (navigator.getGamepads replaced before the
-//              page loads): A starts round 1, the left stick moves the moth
+//              page loads): the left stick moves the moth; after round 1
+//              ends with a touch stick held (which must start nothing), A
+//              starts round 2
 //   stick      a touch drag moves the moth back, and sends no arrow key (the
 //              loader's swipe detector must never see the stick's touches)
 //   report     F2 opens the note over the canvas, focused; typed key by key
@@ -110,8 +113,14 @@ async function pad(axes, pressed) { await evaluate(`window.__pad = { axes: ${JSO
 // A report: F2, the note typed key by key, Enter; answers the report's JSON.
 async function report(note) {
   const n0 = lines.filter((l) => l.startsWith("substratic: playtest report ")).length;
+  const c0 = lines.filter((l) => l.startsWith("substratic: playtest capture ")).length;
   await key("F2", "F2", 113);
-  if (!(await waitLine((l) => l.startsWith("substratic: playtest capture "), 5000))) return null;
+  // this report's own capture line, not an earlier one
+  const t1 = Date.now();
+  while (lines.filter((l) => l.startsWith("substratic: playtest capture ")).length <= c0) {
+    if (Date.now() - t1 > 5000) return null;
+    await sleep(100);
+  }
   await sleep(300);
   const open = await evaluate("(() => { const n = document.getElementById('sub-note'); return !!n && n.style.display === 'block' && document.activeElement === n.querySelector('input'); })()");
   if (!open) return null;
@@ -157,14 +166,20 @@ else fail("update", String(upd));
 await evaluate(`(() => { const a = globalThis.SigilWebApp; window.__keys = []; const d = a.dispatch.bind(a);
   a.dispatch = function (t, p) { if (t === "keydown") window.__keys.push(p); return d(t, p); }; return true; })()`);
 
+// ---- a tap starts round 1 ---------------------------------------------------------------
+{
+  const [TW, TH] = await evaluate("(() => { const r = document.querySelector('#stage').getBoundingClientRect(); return [r.width, r.height]; })()");
+  await cdp("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: Math.round(TW / 2), y: Math.round(TH / 2), id: 3 }] });
+  await sleep(80);
+  await cdp("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+}
+if (await waitLine((l) => l === "emberlight: round 1", 3000)) pass("a tap started round 1");
+else fail("tap", "a tap on the title did not start a round");
+
 // ---- the gamepad ---------------------------------------------------------------------------
-await pad([0, 0, 0, 0], [0]);                    // A held
-await sleep(300);
-await pad([0, 0, 0, 0], []);
-if (await waitLine((l) => l === "emberlight: round 1", 3000)) pass("gamepad A started round 1");
-else fail("gamepad", "A did not start a round");
 const r1 = await report("pad");
-if (r1) pass(`report (note ${JSON.stringify(r1.json.note)}, phase ${r1.json.location.phase})`); else fail("report", "the first report never arrived");
+if (r1 && r1.json.location.phase === "play") pass(`report (note ${JSON.stringify(r1.json.note)}, phase play)`);
+else fail("report", r1 ? `phase ${r1.json.location.phase}` : "the first report never arrived");
 await pad([1, 0, 0, 0], []);                     // the left stick hard right
 await sleep(1200);
 await pad([0, 0, 0, 0], []);
@@ -204,6 +219,25 @@ if (got.includes("F2")) pass("a key outside the note reaches the loader's dispat
 else fail("keys", "the positive control: F2 never reached the dispatch");
 const leaked = got.filter((k) => k.length === 1);
 if (leaked.length === 0) pass("the notes' typing never reached the game"); else fail("keys", leaked.join(""));
+
+// ---- the end of round 1: a held stick starts nothing; the pad's A does ------------------
+{
+  const [EW, EH] = await evaluate("(() => { const r = document.querySelector('#stage').getBoundingClientRect(); return [r.width, r.height]; })()");
+  const sx = Math.round(EW * 0.5), sy = Math.round(EH * 0.5);
+  await cdp("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: sx, y: sy, id: 4 }] });
+  await cdp("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: sx + 50, y: sy, id: 4 }] });
+  const over = await waitLine((l) => l.startsWith("emberlight: round over "), 75000);
+  if (over) pass(`round 1 ended (${over.slice(11)})`); else fail("round", "round 1 never ended");
+  await sleep(2500);                               // well past the end screen's one second
+  const early = lines.includes("emberlight: round 2");
+  await cdp("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  if (!early) pass("a stick held through the end of the round started nothing"); else fail("round", "the held stick started round 2");
+  await pad([0, 0, 0, 0], [0]);                  // A
+  await sleep(300);
+  await pad([0, 0, 0, 0], []);
+  if (await waitLine((l) => l === "emberlight: round 2", 3000)) pass("gamepad A started round 2");
+  else fail("gamepad", "A did not start round 2");
+}
 
 // ---- the store --------------------------------------------------------------------------------
 await key("p", "KeyP", 80);

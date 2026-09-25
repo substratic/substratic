@@ -207,10 +207,14 @@
   var lastPad = null;
   function q(v) { return (Math.round(v * 100) / 100).toString(); }
   function padPayload() {
-    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    var pads;
+    try { pads = navigator.getGamepads ? navigator.getGamepads() : []; }
+    catch (err) { return "0"; }           // e.g. a cross-origin frame without allow="gamepad"
     for (var i = 0; i < pads.length; i++) {
       var p = pads[i];
-      if (!p || !p.connected) continue;
+      // only the standard layout: its button and axis indices are the ones
+      // mapped here (natively, only pads GLFW has a mapping for count too)
+      if (!p || !p.connected || p.mapping !== "standard") continue;
       var btn = function (k) { var b = p.buttons[k]; return b ? b : { pressed: false, value: 0 }; };
       var bits = 0;
       for (var bit = 0; bit < STD_FOR_BIT.length; bit++) if (btn(STD_FOR_BIT[bit]).pressed) bits |= 1 << bit;
@@ -221,9 +225,9 @@
     return "0";
   }
   function pollPad() {
+    requestAnimationFrame(pollPad);        // first: nothing below can stop the loop
     var s = padPayload();
     if (s !== lastPad) { lastPad = s; send("pad", s); }
-    requestAnimationFrame(pollPad);
   }
 
   // ---- fullscreen -------------------------------------------------------------------

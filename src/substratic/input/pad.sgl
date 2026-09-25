@@ -27,7 +27,7 @@
 
   (export %pad-read BUTTONS AXES
           make-pad pad? pad-connected? pad-axis pad-held pad-held? pad-pressed? pad-released?
-          pad-set! pad-end-frame! pad-poll! parse-pad-payload pad-dispatch!)
+          pad-set! pad-end-frame! pad-poll! parse-pad-payload pad-dispatch! decode-read)
 
   (begin
     (define BUTTONS '(a b x y lb rb back start guide lthumb rthumb up right down left))
@@ -83,17 +83,23 @@
     (define (decode-read bv)
       (let loop ((i 0) (acc '()))
         (if (< i 6)
-            (loop (+ i 1) (cons (- (/ (bytevector-u8-ref bv i) 127.5) 1.0) acc))
+            (loop (+ i 1) (cons (/ (- (bytevector-u8-ref bv i) 128) 127.0) acc))
             (cons (reverse acc)
                   (+ (bytevector-u8-ref bv 6) (* 256 (bytevector-u8-ref bv 7)))))))
 
-    ;; Desktop: read the first connected gamepad. On the web, a no-op (the
-    ;; page's events come through pad-dispatch!).
-    (define (pad-poll! p)
-      (let ((bv (guard (e (#t #f)) (%pad-read))))
-        (if bv
-            (let ((d (decode-read bv))) (pad-set! p #t (car d) (cdr d)))
-            (when (pad-connected p) (pad-set! p #f RESTING 0)))))
+    ;; Desktop: read the first connected gamepad. On the web, a no-op: the
+    ;; page's events come through pad-dispatch!, and a read there (which
+    ;; always answers "none") would wipe what the page set. So one shared
+    ;; frame can call it on both targets.
+    (cond-expand
+      (wasm
+       (define (pad-poll! p) #f))
+      (else
+       (define (pad-poll! p)
+         (let ((bv (guard (e (#t #f)) (%pad-read))))
+           (if bv
+               (let ((d (decode-read bv))) (pad-set! p #t (car d) (cdr d)))
+               (when (pad-connected p) (pad-set! p #f RESTING 0)))))))
 
     (define (first-six l) (let loop ((l l) (k 0)) (if (or (null? l) (= k 6)) (quote ()) (cons (car l) (loop (cdr l) (+ k 1))))))
 

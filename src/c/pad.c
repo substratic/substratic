@@ -2,8 +2,8 @@
  * pad.c - (substratic input pad)'s native: the first connected gamepad.
  *
  *   (%pad-read) -> an 8-byte bytevector, or #f when no gamepad is connected
- *       bytes 0..5  the axes LX LY RX RY LT RT, each -1..1 as 0..255
- *                   (value = byte / 127.5 - 1)
+ *       bytes 0..5  the axes LX LY RX RY LT RT, each -1..1 as 1..255
+ *                   (value = (byte - 128) / 127, so centre is exactly 0)
  *       bytes 6..7  the 15 buttons as bits, low byte first, in GLFW's order:
  *                   A B X Y LB RB BACK START GUIDE LTHUMB RTHUMB UP RIGHT DOWN LEFT
  *
@@ -46,8 +46,8 @@ static Value native_pad_read(SigilVM *vm, int argc, Value *args)
             float a = st.axes[i];
             if (a < -1.0f) a = -1.0f;
             if (a > 1.0f) a = 1.0f;
-            int q = (int)((a + 1.0f) * 127.5f + 0.5f);
-            o[i] = (uint8_t)(q > 255 ? 255 : q);
+            int q = 128 + (int)(a * 127.0f + (a < 0 ? -0.5f : 0.5f));
+            o[i] = (uint8_t)(q < 1 ? 1 : (q > 255 ? 255 : q));
         }
         unsigned int bits = 0;
         for (int b = 0; b < 15; b++) if (st.buttons[b]) bits |= 1u << b;

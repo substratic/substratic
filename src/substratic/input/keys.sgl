@@ -56,16 +56,19 @@
     (define (keys-pressed? ks k) (and (memq k (keys-pressed ks)) #t))
     (define (keys-released? ks k) (and (memq k (keys-released ks)) #t))
 
-    ;; Natively: feed the state from sigil-desktop's polls for the keys the
-    ;; game listens to. On the web the loader's events do it.
+    ;; Natively: feed the state from sigil-desktop's key state for the keys the
+    ;; game listens to: held is what the window says is down now (so a key
+    ;; still held after keys-clear! counts again at once), and a key pressed
+    ;; and released within one frame is still a press. On the web the
+    ;; loader's events do it.
     (cond-expand
       (wasm
        (define (keys-poll! ks names) #f))
       (else
        (define (keys-poll! ks names)
          (for-each (lambda (k)
-                     (when (key-pressed? k) (keys-down! ks k))
-                     (when (key-released? k) (keys-up! ks k)))
+                     (when (or (key-pressed? k) (key-down? k)) (keys-down! ks k))
+                     (unless (key-down? k) (keys-up! ks k)))
                    names))))
 
     ;; A DOM KeyboardEvent.key -> sigil-desktop's name, or #f for a key

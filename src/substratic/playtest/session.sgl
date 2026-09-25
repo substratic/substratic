@@ -332,7 +332,9 @@
 
     (define (playtest-cancel! p)
       (clear! p)
-      (say! p "report discarded"))
+      (say! p "report discarded")
+      (display "substratic: playtest discarded")
+      (newline))
 
     ;; Desktop: write the report under <store-root>/reports/<stamp>/.
     ;; Answers the directory, or #f (and says why).

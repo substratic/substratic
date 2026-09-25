@@ -65,6 +65,9 @@
     (define (web-dispatch type payload)
       (cond ((string=? type "frame") (tick! payload) 0)
             ((string=? type "param") (param! payload) 0)
+            ;; a touch or a click on the canvas (the loader's pointerdown) is a
+            ;; start on the title and end screens
+            ((string=? type "pointerdown") (core-touched!) 0)
             ((playtest-dispatch! (core-playtest) type payload) 1)
             ((updater-dispatch! (core-updater) type payload) 1)
             ((pad-dispatch! (core-pad) type payload) 1)
