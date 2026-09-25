@@ -1,0 +1,248 @@
+;;; (substratic input) - Keys and touch sticks, the same on both targets.
+;;;
+;;; KEYS. A key state holds the keys down now, and the keys pressed and
+;;; released since the last keys-end-frame!. The shells feed it events:
+;;; natively from sigil-desktop's key-pressed? / key-released? polls
+;;; (keys-poll!, given the keys the game listens to), on the web from the
+;;; loader's keydown / keyup, whose DOM names dom-key->symbol turns into
+;;; sigil-desktop's names ('left, 'return, 'f1, 'a ...), so a game reads one
+;;; set of symbols whatever the target.
+;;;
+;;; STICKS. The page's touch layer (web/substratic.js) sends each stick as
+;;; ("stick", "NAME,DX,DY"): the thumb's offset from where it landed, in
+;;; ring radii, dx right and dy DOWN, the length clamped to 1. A stick
+;;; state keeps the latest vector per name; a lifted thumb sends 0,0.
+;;; Two readers turn a vector into what a game wants:
+;;;
+;;;   stick-sector   one of eight directions, for a platformer, tuned for
+;;;                  clinging and wall jumps (below)
+;;;   stick-analog   a vector with a radial dead zone, rescaled so the
+;;;                  edge of the dead zone reads 0 (a first-person walk or
+;;;                  look)
+;;;
+;;; The sector reader is Harkfell's (engine stick): the left and right
+;;; sectors are the widest, so "hold toward the wall" does not slip into a
+;;; diagonal (a climb) when the thumb wobbles:
+;;;
+;;;   e, w      60 degrees each (within 30 of horizontal)
+;;;   n, s      50 degrees each (within 25 of vertical)
+;;;   diagonals 35 degrees each
+;;;
+;;; Two kinds of hysteresis keep a thumb resting on a boundary from
+;;; flickering: the sector in force is widened by 6 degrees on each side
+;;; before the others are asked, and the dead zone engages below DEAD-OUT
+;;; but lets go only below DEAD-IN. Angles are compared through tangents
+;;; (|dy| < tan(a) * |dx|), so no trigonometry runs per event and every
+;;; target computes the same answer.
+
+(define-library (substratic input)
+  (cond-expand
+    (wasm (import (sigil struct)
+                  (sigil math)
+                  (sigil list)
+                  (sigil string)))
+    (else (import (sigil struct)
+                  (sigil math)
+                  (sigil list)
+                  (sigil string)
+                  (sigil desktop))))
+
+  (export make-keys keys? keys-down! keys-up! keys-clear! keys-end-frame!
+          keys-held? keys-pressed? keys-released? keys-held keys-pressed
+          keys-poll! dom-key->symbol
+          make-sticks sticks? sticks-set! sticks-clear! stick-vector stick-names
+          parse-stick-payload input-dispatch!
+          stick-sector sector->hv stick-analog
+          DEAD-IN DEAD-OUT)
+
+  (begin
+    ;; --- keys ------------------------------------------------------------------
+
+    (define-struct keys
+      (held default: '() mutable: #t)
+      (pressed default: '() mutable: #t)
+      (released default: '() mutable: #t))
+
+    (define (make-keys) (keys))
+
+    (define (keys-down! ks k)
+      (unless (memq k (keys-held ks))
+        (set-keys-held! ks (cons k (keys-held ks)))
+        (set-keys-pressed! ks (cons k (keys-pressed ks)))))
+
+    (define (keys-up! ks k)
+      (when (memq k (keys-held ks))
+        (set-keys-held! ks (filter (lambda (x) (not (eq? x k))) (keys-held ks)))
+        (set-keys-released! ks (cons k (keys-released ks)))))
+
+    ;; Everything let go (a lost focus: a keyup that goes to another window
+    ;; would otherwise hold the key forever).
+    (define (keys-clear! ks)
+      (set-keys-released! ks (append (keys-held ks) (keys-released ks)))
+      (set-keys-held! ks '()))
+
+    (define (keys-end-frame! ks)
+      (set-keys-pressed! ks '())
+      (set-keys-released! ks '()))
+
+    (define (keys-held? ks k) (and (memq k (keys-held ks)) #t))
+    (define (keys-pressed? ks k) (and (memq k (keys-pressed ks)) #t))
+    (define (keys-released? ks k) (and (memq k (keys-released ks)) #t))
+
+    ;; Natively: feed the state from sigil-desktop's polls for the keys the
+    ;; game listens to. On the web the loader's events do it (input-dispatch!).
+    (cond-expand
+      (wasm
+       (define (keys-poll! ks names) #f))
+      (else
+       (define (keys-poll! ks names)
+         (for-each (lambda (k)
+                     (when (key-pressed? k) (keys-down! ks k))
+                     (when (key-released? k) (keys-up! ks k)))
+                   names))))
+
+    ;; A DOM KeyboardEvent.key -> sigil-desktop's name, or #f for a key
+    ;; with no name there. Letters are lower case whatever the shift.
+    (define DOM-NAMES
+      (list (cons "ArrowLeft" 'left) (cons "ArrowRight" 'right)
+            (cons "ArrowUp" 'up) (cons "ArrowDown" 'down)
+            (cons " " 'space) (cons "Enter" 'return) (cons "Escape" 'escape)
+            (cons "Tab" 'tab) (cons "Backspace" 'backspace) (cons "Delete" 'delete)
+            (cons "Shift" 'shift) (cons "Control" 'ctrl) (cons "Alt" 'alt)
+            (cons "Home" 'home) (cons "End" 'end)
+            (cons "PageUp" 'page-up) (cons "PageDown" 'page-down)
+            (cons "," 'comma) (cons "." 'period) (cons "/" 'slash)
+            (cons ";" 'semicolon) (cons "'" 'apostrophe) (cons "-" 'minus)
+            (cons "=" 'equal) (cons "[" 'left-bracket) (cons "]" 'right-bracket)
+            (cons "\\" 'backslash) (cons "`" 'grave)))
+
+    (define (dom-key->symbol k)
+      (let ((e (assoc k DOM-NAMES))
+            (n (string-length k)))
+        (cond (e (cdr e))
+              ((and (= n 1) (char-alphabetic? (string-ref k 0)))
+               (string->symbol (string (char-downcase (string-ref k 0)))))
+              ((and (= n 1) (char-numeric? (string-ref k 0)))
+               (string->symbol k))
+              ((and (>= n 2) (<= n 3) (char=? (string-ref k 0) #\F)
+                    (string->number (substring k 1 n)))
+               (string->symbol (string-append "f" (substring k 1 n))))
+              (else #f))))
+
+    ;; --- sticks ----------------------------------------------------------------
+
+    (define-struct sticks
+      (vectors default: '() mutable: #t))   ; ((name dx . dy) ...)
+
+    (define (make-sticks) (sticks))
+
+    (define (sticks-set! st name dx dy)
+      (set-sticks-vectors! st
+                           (cons (cons name (cons dx dy))
+                                 (filter (lambda (e) (not (equal? (car e) name))) (sticks-vectors st)))))
+
+    (define (sticks-clear! st) (set-sticks-vectors! st '()))
+
+    ;; (dx . dy), (0.0 . 0.0) for a stick never touched.
+    (define (stick-vector st name)
+      (let ((e (assoc name (sticks-vectors st))))
+        (if e (cdr e) (cons 0.0 0.0))))
+
+    (define (stick-names st) (map car (sticks-vectors st)))
+
+    ;; "NAME,DX,DY" -> (list name dx dy), or #f for anything else. The
+    ;; length is clamped to 1 here too: the page's clamp is not trusted.
+    (define (parse-stick-payload s)
+      (let ((parts (string-split s ",")))
+        (and (= (length parts) 3)
+             (> (string-length (car parts)) 0)
+             (let ((dx (string->number (cadr parts)))
+                   (dy (string->number (caddr parts))))
+               (and dx dy
+                    (let ((m (sqrt (+ (* dx dx) (* dy dy)))))
+                      (if (> m 1.0)
+                          (list (car parts) (/ dx m) (/ dy m))
+                          (list (car parts) (* 1.0 dx) (* 1.0 dy)))))))))
+
+    ;; The web loader's and the page's input events, into a key state and a
+    ;; stick state. #t when the event was one of them.
+    ;;   ("keydown" | "keyup", DOM key)   ("stick", "NAME,DX,DY")
+    ;;   ("blur", _)  everything let go
+    (define (input-dispatch! ks st type payload)
+      (cond ((string=? type "keydown")
+             (let ((k (dom-key->symbol payload))) (when k (keys-down! ks k)) #t))
+            ((string=? type "keyup")
+             (let ((k (dom-key->symbol payload))) (when k (keys-up! ks k)) #t))
+            ((string=? type "stick")
+             (let ((p (parse-stick-payload payload)))
+               (when p (sticks-set! st (car p) (cadr p) (caddr p)))
+               #t))
+            ((string=? type "blur")
+             (keys-clear! ks)
+             (sticks-clear! st)
+             #t)
+            (else #f)))
+
+    ;; --- the eight-way reader --------------------------------------------------
+
+    (define DEAD-IN 0.2)     ; below this the stick is at rest
+    (define DEAD-OUT 0.28)   ; from rest, this far is needed to move
+
+    ;; tan of 30, 36, 24 (the horizontal sectors' half-width: plain,
+    ;; widened, narrowed) and of 25, 31, 19 (the vertical ones').
+    (define TAN-H 0.57735)
+    (define TAN-H-WIDE 0.72654)
+    (define TAN-H-NARROW 0.44523)
+    (define TAN-V 0.46631)
+    (define TAN-V-WIDE 0.60086)
+    (define TAN-V-NARROW 0.34433)
+
+    (define (diagonal? s) (or (eq? s 'ne) (eq? s 'nw) (eq? s 'se) (eq? s 'sw)))
+    (define (horizontal? s) (or (eq? s 'e) (eq? s 'w)))
+    (define (vertical? s) (or (eq? s 'n) (eq? s 's)))
+
+    ;; The sector for (dx, dy), given the sector in force before (prev):
+    ;; 'none or one of e ne n nw w sw s se.
+    (define (stick-sector dx dy prev)
+      (let ((m2 (+ (* dx dx) (* dy dy)))
+            (dead (if (eq? prev 'none) DEAD-OUT DEAD-IN)))
+        (if (< m2 (* dead dead))
+            'none
+            (let* ((ax (abs dx))
+                   (ay (abs dy))
+                   (th (cond ((horizontal? prev) TAN-H-WIDE)
+                             ((diagonal? prev) TAN-H-NARROW)
+                             (else TAN-H)))
+                   (tv (cond ((vertical? prev) TAN-V-WIDE)
+                             ((diagonal? prev) TAN-V-NARROW)
+                             (else TAN-V))))
+              (cond ((< ay (* th ax)) (if (> dx 0) 'e 'w))
+                    ((< ax (* tv ay)) (if (> dy 0) 's 'n))
+                    ((> dx 0) (if (> dy 0) 'se 'ne))
+                    (else (if (> dy 0) 'sw 'nw)))))))
+
+    ;; A sector as (h . v), -1, 0 or 1 in each; v is screen-down positive.
+    (define (sector->hv s)
+      (case s
+        ((e) (cons 1 0))
+        ((ne) (cons 1 -1))
+        ((n) (cons 0 -1))
+        ((nw) (cons -1 -1))
+        ((w) (cons -1 0))
+        ((sw) (cons -1 1))
+        ((s) (cons 0 1))
+        ((se) (cons 1 1))
+        (else (cons 0 0))))
+
+    ;; --- the analogue reader ---------------------------------------------------
+
+    ;; (dx . dy) with a radial dead zone of `dead` ring radii: inside it,
+    ;; (0.0 . 0.0); outside, the same direction with the length rescaled
+    ;; from dead..1 to 0..1, so a push starts from zero rather than jumping
+    ;; to `dead`.
+    (define (stick-analog dx dy dead)
+      (let ((m (sqrt (+ (* dx dx) (* dy dy)))))
+        (if (or (<= m dead) (<= m 0.0))
+            (cons 0.0 0.0)
+            (let ((k (/ (min 1.0 (/ (- m dead) (- 1.0 dead))) m)))
+              (cons (* dx k) (* dy k))))))))

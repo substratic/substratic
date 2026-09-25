@@ -1,0 +1,53 @@
+;;; substratic - a small game engine for Sigil
+;;;
+;;; The pieces a Sigil game needs on the desktop and the web: a pixel view
+;;; at whole-number scales, a store and settings, tweens on a fixed clock,
+;;; keys and touch sticks, the version.json update check, and playtest
+;;; reports. Each is a module, (substratic <area>).
+
+(define sigil-repo "codeberg:sigil/sigil")
+
+(package
+  name: "substratic"
+  version: "0.1.0"
+  sigil: "0.22.7"
+  description: "A small game engine for Sigil, on the desktop and the web"
+  url: "https://github.com/substratic/substratic"
+  license: "BSD-3-Clause"
+  authors: (list "David Wilson <david@daviwil.com>")
+
+  configs: (list
+    (config
+      name: 'dev
+      output-dir: "build/dev"
+      debug?: #t
+      optimize: 0)
+    (config
+      name: 'release
+      output-dir: "build/release"
+      debug?: #f
+      optimize: 2
+      backend: 'native)
+    (config
+      name: 'web
+      output-dir: "build/web"
+      toolchain: 'zig
+      target: "wasm32-wasi"
+      backend: 'native
+      debug?: #f
+      optimize: 2
+      features: '(web wasm graphics)))
+
+  dependencies: (list
+    ;; The window, keys and the GL proc loader; native only.
+    (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
+    ;; Drawing, both targets.
+    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
+    ;; version.json and report.json.
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0")
+    ;; Web only: localStorage for (substratic store).
+    (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
+
+  dev-dependencies: (list
+    (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
+    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7")))

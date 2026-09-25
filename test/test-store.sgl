@@ -1,0 +1,77 @@
+;;; (substratic store), native half: the data directory chain, and datums
+;;; through files under a scratch root. The web half (localStorage) runs in
+;;; the wasm test page (test/web).
+
+(import (sigil test)
+        (sigil fs)
+        (sigil process)
+        (sigil time)
+        (substratic store))
+
+(define saved
+  (map (lambda (name) (cons name (getenv name)))
+       '("XDG_DATA_HOME" "APPDATA" "HOME")))
+
+(define (with-env xdg appdata home thunk)
+  (setenv! "XDG_DATA_HOME" xdg)
+  (setenv! "APPDATA" appdata)
+  (setenv! "HOME" home)
+  (set-store-root! #f)
+  (let ((result (thunk)))
+    (for-each (lambda (pair) (setenv! (car pair) (cdr pair))) saved)
+    (set-store-root! #f)
+    result))
+
+(test-group "store: the data directory chain, named by the game"
+  (set-store-app! "a-game")
+  (test "XDG_DATA_HOME wins over everything"
+    (assert-equal "/xdg/a-game"
+      (with-env "/xdg" "C:/Users/p/AppData/Roaming" "/home/p" store-root)))
+  (test "APPDATA (Windows) comes before HOME"
+    (assert-equal "C:/Users/p/AppData/Roaming/a-game"
+      (with-env #f "C:/Users/p/AppData/Roaming" "/home/p" store-root)))
+  (test "Linux: HOME/.local/share when the two are absent"
+    (assert-equal "/home/p/.local/share/a-game"
+      (with-env #f #f "/home/p" store-root)))
+  (test "nothing set: the current directory"
+    (assert-equal "./a-game"
+      (with-env #f #f #f store-root)))
+  (test "set-store-app! drops a cached root"
+    (with-env "/xdg" #f #f
+      (lambda ()
+        (store-root)
+        (set-store-app! "another")
+        (assert-equal "/xdg/another" (store-root))))))
+
+(define root (string-append "/tmp/substratic-test-store-" (number->string (current-jiffy))))
+
+(test-group "store: datums through files"
+  (test "nothing is stored yet"
+    (set-store-root! root)
+    (assert-false (store-get "save"))
+    (assert-false (store-read-datum "save")))
+  (test "a write lands as a file under the root"
+    (set-store-root! root)
+    (assert-true (store-write-datum! "save" '(room (x . 3) (items "a" "b"))))
+    (assert-true (file-exists? (string-append root "/save.sgl"))))
+  (test "the datum reads back equal"
+    (set-store-root! root)
+    (assert-equal '(room (x . 3) (items "a" "b")) (store-read-datum "save")))
+  (test "remove empties the key, and removing again is still #t"
+    (set-store-root! root)
+    (assert-true (store-remove! "save"))
+    (assert-false (store-get "save"))
+    (assert-true (store-remove! "save"))))
+
+(test-group "store: what does not read back"
+  (test "text that is not one datum is #f"
+    (set-store-root! root)
+    (assert-true (store-set! "junk" "(this is (not"))
+    (assert-false (store-read-datum "junk"))
+    (assert-true (store-set! "junk" ""))
+    (assert-false (store-read-datum "junk"))
+    (assert-true (store-set! "junk" "(a) (b)"))
+    (assert-false (store-read-datum "junk")))
+  (test "datum->text and text->datum are inverses"
+    (set-store-root! root)
+    (assert-equal '(1 "two" three) (text->datum (datum->text '(1 "two" three))))))

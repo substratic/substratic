@@ -1,0 +1,10 @@
+(pipeline ci
+  on: #[ (push) (manual) ]
+
+  (job ci
+    steps: #[
+      (shell name: deps  "sigil deps install")
+      (shell name: build "scripts/dev sigil build")
+      (shell name: test  "scripts/dev sigil test --sgl")
+      (shell name: test-native "scripts/dev sigil test --sgl --backend native")
+    ]))

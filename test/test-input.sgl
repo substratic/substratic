@@ -1,0 +1,130 @@
+;;; (substratic input): the key state, DOM names, the stick payloads, and
+;;; the two stick readers. The sector tests are Harkfell's (engine stick)
+;;; tests, unchanged. Offsets are in ring radii, dy down.
+
+(import (sigil test)
+        (sigil math)
+        (substratic input))
+
+(test-group "keys: held, pressed, released"
+  (test "a press is held and pressed until the frame ends; then only held"
+    (let ((ks (make-keys)))
+      (keys-down! ks 'left)
+      (assert-true (keys-held? ks 'left))
+      (assert-true (keys-pressed? ks 'left))
+      (keys-end-frame! ks)
+      (assert-true (keys-held? ks 'left))
+      (assert-false (keys-pressed? ks 'left))))
+  (test "an auto-repeated keydown is not a second press"
+    (let ((ks (make-keys)))
+      (keys-down! ks 'a)
+      (keys-end-frame! ks)
+      (keys-down! ks 'a)
+      (assert-false (keys-pressed? ks 'a))))
+  (test "a release is seen once"
+    (let ((ks (make-keys)))
+      (keys-down! ks 'z)
+      (keys-up! ks 'z)
+      (assert-false (keys-held? ks 'z))
+      (assert-true (keys-released? ks 'z))
+      (keys-end-frame! ks)
+      (assert-false (keys-released? ks 'z))))
+  (test "a keyup for a key never down is ignored"
+    (let ((ks (make-keys)))
+      (keys-up! ks 'q)
+      (assert-false (keys-released? ks 'q))))
+  (test "clear lets everything go"
+    (let ((ks (make-keys)))
+      (keys-down! ks 'a)
+      (keys-down! ks 'b)
+      (keys-clear! ks)
+      (assert-equal '() (keys-held ks))
+      (assert-true (keys-released? ks 'a)))))
+
+(test-group "keys: DOM names are sigil-desktop's names"
+  (test "arrows, space, enter, escape"
+    (assert-equal 'left (dom-key->symbol "ArrowLeft"))
+    (assert-equal 'space (dom-key->symbol " "))
+    (assert-equal 'return (dom-key->symbol "Enter"))
+    (assert-equal 'escape (dom-key->symbol "Escape")))
+  (test "letters are lower case whatever the shift; digits are themselves"
+    (assert-equal 'a (dom-key->symbol "A"))
+    (assert-equal 'a (dom-key->symbol "a"))
+    (assert-equal '|7| (dom-key->symbol "7")))
+  (test "function keys"
+    (assert-equal 'f1 (dom-key->symbol "F1"))
+    (assert-equal 'f12 (dom-key->symbol "F12")))
+  (test "a key with no name is #f"
+    (assert-false (dom-key->symbol "Unidentified"))
+    (assert-false (dom-key->symbol "Fn"))))
+
+(test-group "sticks: payloads"
+  (test "a payload parses, and the length is clamped to 1"
+    (assert-equal (list "move" 0.5 -0.25) (parse-stick-payload "move,0.5,-0.25"))
+    (let ((p (parse-stick-payload "look,3,4")))
+      (assert-true (< (abs (- (cadr p) 0.6)) 1e-9))
+      (assert-true (< (abs (- (caddr p) 0.8)) 1e-9))))
+  (test "anything else is #f"
+    (assert-false (parse-stick-payload "move,0.5"))
+    (assert-false (parse-stick-payload ",0.5,0.5"))
+    (assert-false (parse-stick-payload "move,x,0.5")))
+  (test "input-dispatch! routes keys and sticks, and a blur lets all go"
+    (let ((ks (make-keys)) (st (make-sticks)))
+      (assert-true (input-dispatch! ks st "keydown" "ArrowUp"))
+      (assert-true (input-dispatch! ks st "stick" "move,0.1,0.2"))
+      (assert-false (input-dispatch! ks st "frame" "16.6"))
+      (assert-true (keys-held? ks 'up))
+      (assert-equal (cons 0.1 0.2) (stick-vector st "move"))
+      (assert-equal (cons 0.0 0.0) (stick-vector st "look"))
+      (input-dispatch! ks st "blur" "")
+      (assert-false (keys-held? ks 'up))
+      (assert-equal (cons 0.0 0.0) (stick-vector st "move")))))
+
+(test-group "sticks: the analogue reader"
+  (test "inside the dead zone is rest"
+    (assert-equal (cons 0.0 0.0) (stick-analog 0.1 0.0 0.2)))
+  (test "the edge of the dead zone reads zero; full push reads one"
+    (let ((a (stick-analog 0.2000001 0.0 0.2))
+          (b (stick-analog 1.0 0.0 0.2)))
+      (assert-true (< (car a) 1e-5))
+      (assert-true (< (abs (- (car b) 1.0)) 1e-9))))
+  (test "the direction is kept"
+    (let ((a (stick-analog 0.0 -0.6 0.2)))
+      (assert-true (< (abs (car a)) 1e-9))
+      (assert-true (< (abs (- (cdr a) -0.5)) 1e-9)))))
+
+(define (at deg r)
+  (let ((t (/ (* deg 3.141592653589793) 180.0)))
+    (list (* r (cos t)) (- (* r (sin t))))))
+
+(define (sector deg prev)
+  (let ((v (at deg 0.8)))
+    (stick-sector (car v) (cadr v) prev)))
+
+(test-group "stick sectors"
+  (test "straight right is e, straight up is n"
+    (assert-equal 'e (sector 0 'none))
+    (assert-equal 'n (sector 90 'none)))
+  (test "a thumb 25 degrees off horizontal is still e (the wide sector)"
+    (assert-equal 'e (sector 25 'none))
+    (assert-equal 'e (sector -25 'none)))
+  (test "past 30 degrees it is the diagonal"
+    (assert-equal 'ne (sector 33 'none))
+    (assert-equal 'se (sector -33 'none)))
+  (test "within 25 degrees of vertical is n"
+    (assert-equal 'n (sector 70 'none))
+    (assert-equal 'ne (sector 60 'none)))
+  (test "hysteresis: at 33 degrees, e held stays e; ne held stays ne at 27"
+    (assert-equal 'e (sector 33 'e))
+    (assert-equal 'ne (sector 27 'ne)))
+  (test "sector->hv"
+    (assert-equal (cons 1 -1) (sector->hv 'ne))
+    (assert-equal (cons 0 0) (sector->hv 'none))))
+
+(test-group "stick dead zone"
+  (test "from rest, 0.25 of the radius is still rest; 0.3 moves"
+    (assert-equal 'none (stick-sector 0.25 0.0 'none))
+    (assert-equal 'e (stick-sector 0.3 0.0 'none)))
+  (test "moving, 0.22 holds the direction; 0.18 lets go"
+    (assert-equal 'e (stick-sector 0.22 0.0 'e))
+    (assert-equal 'none (stick-sector 0.18 0.0 'e))))

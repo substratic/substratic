@@ -1,0 +1,9 @@
+#!/bin/sh
+# Run a command inside the guix environment the native build needs.
+#   scripts/dev sigil build
+#   scripts/dev sigil test
+# The runtime libraries (libGL, libEGL, libwayland-client, libX11) are
+# loaded by name at run time; sigil-desktop's resolver looks in
+# $GUIX_ENVIRONMENT/lib, so no LD_LIBRARY_PATH is set here.
+cd "$(dirname "$0")/.." || exit 1
+exec guix shell -m manifest.scm -- sh -c 'CPATH=$GUIX_ENVIRONMENT/include LIBRARY_PATH=$GUIX_ENVIRONMENT/lib exec "$@"' sh "$@"

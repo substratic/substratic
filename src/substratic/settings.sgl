@@ -1,0 +1,119 @@
+;;; (substratic settings) - A game's settings: rows, the values in force,
+;;; and where they live.
+;;;
+;;; The game declares its rows as a table: each row has an id, a name, the
+;;; values in stepping order, a default, and the store key it lives under.
+;;; Every setting is its own store key holding a plain datum. Use symbols
+;;; or numbers, not booleans: a missing key reads as #f from the store, and
+;;; a boolean row could not tell that from off. A missing or unreadable key
+;;; is the row's default.
+;;;
+;;; The settings in force are an alist of (id . value). The verbs on it
+;;; (settings-value, settings-with, settings-step) are pure; settings-load
+;;; and settings-save! go through (substratic store).
+;;;
+;;; SCHEMA VERSION. The table carries a version. A store without it, or at
+;;; another one, loses its setting keys (the rows' and the table's retired
+;;; keys) and gets the version written, once, at the next load; a store at
+;;; the version keeps what it holds (a stored off wins over a new default of
+;;; on). Bump it when a default changes and every player should see the new
+;;; one. Nothing else in the store is touched.
+;;;
+;;; Extracted from Crash The Stack's (crash settings), which kept its rows
+;;; in the module and its load and save in its shell; here both are the
+;;; table's.
+
+(define-library (substratic settings)
+  (import (sigil struct)
+          (substratic store))
+
+  (export setting setting? setting-id setting-name setting-values setting-default setting-key
+          settings-table settings-table? settings-table-rows settings-table-version
+          settings-table-version-key settings-table-retired
+          make-settings-table setting-ref setting-value? settings-ids
+          settings-defaults settings-value settings-with settings-step
+          settings-load settings-save! settings-migrate!)
+
+  (begin
+    (define-struct setting
+      (id default: #f)
+      (name default: "")
+      (values default: '())        ; the values in stepping order
+      (default default: #f)
+      (key default: ""))           ; the store key
+
+    (define-struct settings-table
+      (rows default: '())
+      (version default: 1)
+      (version-key default: "settings-version")
+      (retired default: '()))      ; store keys no row uses any more
+
+    (define (make-settings-table rows (keys: (version 1) (version-key "settings-version") (retired '())))
+      (settings-table rows: rows version: version version-key: version-key retired: retired))
+
+    (define (settings-ids t) (map setting-id (settings-table-rows t)))
+
+    (define (setting-ref t id)
+      (let loop ((ss (settings-table-rows t)))
+        (cond ((null? ss) #f)
+              ((eq? (setting-id (car ss)) id) (car ss))
+              (else (loop (cdr ss))))))
+
+    (define (setting-value? st v)
+      (and (member v (setting-values st)) #t))
+
+    ;; --- the settings in force -------------------------------------------------
+
+    (define (settings-defaults t)
+      (map (lambda (st) (cons (setting-id st) (setting-default st))) (settings-table-rows t)))
+
+    (define (settings-value t s id)
+      (let ((e (assq id s)))
+        (if e (cdr e) (let ((st (setting-ref t id))) (and st (setting-default st))))))
+
+    ;; s with id at v (v must be one of the row's values; else s).
+    (define (settings-with t s id v)
+      (let ((st (setting-ref t id)))
+        (if (and st (setting-value? st v))
+            (if (assq id s)
+                (map (lambda (e) (if (eq? (car e) id) (cons id v) e)) s)
+                (cons (cons id v) s))
+            s)))
+
+    ;; s with id stepped by delta (+1 forward, -1 back), wrapping.
+    (define (settings-step t s id delta)
+      (let ((st (setting-ref t id)))
+        (if (not st)
+            s
+            (let* ((vs (setting-values st))
+                   (n (length vs))
+                   (at (let loop ((l vs) (i 0))
+                         (cond ((null? l) 0)
+                               ((equal? (car l) (settings-value t s id)) i)
+                               (else (loop (cdr l) (+ i 1)))))))
+              (settings-with t s id (list-ref vs (modulo (+ at delta) n)))))))
+
+    ;; --- the store ---------------------------------------------------------------
+
+    ;; The one-time reset described above. #t when it reset.
+    (define (settings-migrate! t)
+      (if (eqv? (store-read-datum (settings-table-version-key t)) (settings-table-version t))
+          #f
+          (begin
+            (for-each (lambda (st) (store-remove! (setting-key st))) (settings-table-rows t))
+            (for-each store-remove! (settings-table-retired t))
+            (store-write-datum! (settings-table-version-key t) (settings-table-version t))
+            #t)))
+
+    ;; The settings in force from the store (after the reset, when due).
+    (define (settings-load t)
+      (settings-migrate! t)
+      (map (lambda (st)
+             (let ((d (store-read-datum (setting-key st))))
+               (cons (setting-id st) (if (setting-value? st d) d (setting-default st)))))
+           (settings-table-rows t)))
+
+    ;; One setting to the store. Answers what the store said.
+    (define (settings-save! t s id)
+      (let ((st (setting-ref t id)))
+        (and st (store-write-datum! (setting-key st) (settings-value t s id)))))))

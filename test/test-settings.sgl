@@ -1,0 +1,78 @@
+;;; (substratic settings): the pure verbs on a table the test declares,
+;;; the store round trip, and the schema-version reset (the cases Crash
+;;; The Stack's settings test covers, on a generic table).
+
+(import (sigil test)
+        (sigil time)
+        (substratic store)
+        (substratic settings))
+
+(define ROWS
+  (list (setting id: 'music name: "MUSIC" values: (list 'on 'off) default: 'on key: "music")
+        (setting id: 'volume name: "VOLUME" values: (list 0 1 2 3) default: 3 key: "volume")
+        (setting id: 'scale name: "SCALE" values: (list 'x2 'x3 'x4 'fullscreen) default: 'x2 key: "scale")))
+
+(define T2 (make-settings-table ROWS version: 2 retired: (list "hud")))
+
+(define root (string-append "/tmp/substratic-test-settings-" (number->string (current-jiffy))))
+
+(define (fresh-root! tag)
+  (set-store-root! (string-append root "-" tag)))
+
+(test-group "settings: the pure verbs"
+  (test "the defaults, in row order"
+    (assert-equal '((music . on) (volume . 3) (scale . x2)) (settings-defaults T2)))
+  (test "forward wraps, back wraps"
+    (let ((s (settings-defaults T2)))
+      (assert-equal 'off (settings-value T2 (settings-step T2 s 'music 1) 'music))
+      (assert-equal 'on (settings-value T2 (settings-step T2 (settings-step T2 s 'music 1) 'music 1) 'music))
+      (assert-equal 'fullscreen (settings-value T2 (settings-step T2 s 'scale -1) 'scale))))
+  (test "a value outside the row is refused; an unknown id changes nothing"
+    (let ((s (settings-defaults T2)))
+      (assert-equal s (settings-with T2 s 'volume 9))
+      (assert-equal s (settings-with T2 s 'nothing 'on))
+      (assert-equal s (settings-step T2 s 'nothing 1))))
+  (test "a missing entry reads as the row's default"
+    (assert-equal 3 (settings-value T2 '() 'volume))))
+
+(test-group "settings: through the store"
+  (test "a fresh root reads as the defaults, and the version is written"
+    (fresh-root! "fresh")
+    (assert-equal (settings-defaults T2) (settings-load T2))
+    (assert-equal 2 (store-read-datum "settings-version")))
+  (test "every setting stepped once and saved reads back after a fresh load"
+    (fresh-root! "round")
+    (let* ((s0 (settings-load T2))
+           (s1 (settings-step T2 (settings-step T2 (settings-step T2 s0 'music 1) 'volume 1) 'scale 1)))
+      (for-each (lambda (id) (assert-true (settings-save! T2 s1 id))) (settings-ids T2))
+      (assert-equal '((music . off) (volume . 0) (scale . x3)) (settings-load T2))))
+  (test "a key holding garbage or a value outside its row reads as the default"
+    (fresh-root! "garbage")
+    (settings-load T2)
+    (store-set! "music" "(not a")
+    (store-write-datum! "volume" 99)
+    (store-write-datum! "scale" 'x4)
+    (assert-equal '((music . on) (volume . 3) (scale . x4)) (settings-load T2))))
+
+(test-group "settings: the schema version"
+  (test "a store with no version loses its setting keys and the retired ones; other keys stay"
+    (fresh-root! "old")
+    (store-write-datum! "music" 'off)
+    (store-write-datum! "hud" 'b)
+    (store-write-datum! "save" '(room 3))
+    (assert-equal 'on (settings-value T2 (settings-load T2) 'music))
+    (assert-false (store-get "hud"))
+    (assert-equal '(room 3) (store-read-datum "save"))
+    (assert-equal 2 (store-read-datum "settings-version")))
+  (test "a store at the current version keeps what it holds"
+    (fresh-root! "current")
+    (settings-load T2)
+    (store-write-datum! "music" 'off)
+    (assert-equal 'off (settings-value T2 (settings-load T2) 'music)))
+  (test "a store at another version is reset the same way"
+    (fresh-root! "older")
+    (store-write-datum! "settings-version" 1)
+    (store-write-datum! "music" 'off)
+    (assert-true (settings-migrate! T2))
+    (assert-equal 'on (settings-value T2 (settings-load T2) 'music))
+    (assert-false (settings-migrate! T2))))
