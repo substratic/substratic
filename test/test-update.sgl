@@ -39,7 +39,13 @@
     (assert-equal 0 (version-compare "0.2.0" "0.2.0"))
     (assert-equal 0 (version-compare "0.2" "0.2.0")))
   (test "a release is newer than its tagged pre-release"
-    (assert-equal 1 (version-compare "1.0.0" "1.0.0-rc1"))))
+    (assert-equal 1 (version-compare "1.0.0" "1.0.0-rc1"))
+    (assert-equal -1 (version-compare "1.0.0-rc1" "1.0.0")))
+  (test "a later pre-release is newer than an earlier release"
+    (assert-equal 1 (version-compare "1.0.1-rc1" "1.0.0"))
+    (assert-equal -1 (version-compare "1.0.0" "1.0.1-rc1")))
+  (test "two tags compare as text"
+    (assert-equal 1 (version-compare "1.0.0-rc2" "1.0.0-rc1"))))
 
 (define root (string-append "/tmp/substratic-test-update-" (number->string (current-jiffy))))
 

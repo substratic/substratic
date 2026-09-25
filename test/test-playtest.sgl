@@ -175,6 +175,8 @@
              (d (json-decode line)))
         (assert-equal "web" (json-get-in d '(platform)))
         (assert-equal "x3y2" (json-get-in d '(location room))))
+      (assert-equal 'page-wait (playtest-phase p))
+      (playtest-dispatch! p "playtest" "opened")
       (assert-equal 'page (playtest-phase p))
       (assert-true (playtest-busy? p))))
   (test "keys reach the game again only after the page's answer"
@@ -189,6 +191,69 @@
   (test "a failure is said, and play goes on"
     (let ((p (fresh 'web)))
       (playtest-dispatch! p "playtest" "capture")
+      (with-output-to-string (lambda () (playtest-after-frame! p 8 8)))
+      (playtest-dispatch! p "playtest" "opened")
       (playtest-dispatch! p "playtest" "failed no server")
       (assert-false (playtest-busy? p))
       (assert-equal "report NOT saved: no server" (playtest-message p)))))
+
+(test-group "playtest: nothing gets stuck"
+  (define (web-captured)
+    (let ((p (fresh 'web)))
+      (playtest-dispatch! p "playtest" "capture")
+      (with-output-to-string (lambda () (playtest-after-frame! p 8 8)))
+      p))
+  (test "a page that never opens a note: the report is given up, play goes on"
+    (let ((p (web-captured)))
+      (let loop ((i 0)) (when (< i 400) (playtest-after-frame! p 8 8) (loop (+ i 1))))
+      (assert-false (playtest-busy? p))
+      (assert-true (string-contains? (playtest-message p) "did not open a note"))))
+  (test "once the page opened its note, the game waits for the tester"
+    (let ((p (web-captured)))
+      (playtest-dispatch! p "playtest" "opened")
+      (let loop ((i 0)) (when (< i 400) (playtest-after-frame! p 8 8) (loop (+ i 1))))
+      (assert-true (playtest-busy? p))))
+  (test "an Escape that reaches the game while waiting for the page gives up"
+    (let ((p (web-captured)))
+      (assert-true (playtest-dispatch! p "keydown" "Escape"))
+      (assert-false (playtest-busy? p))))
+  (test "a late answer to an earlier report does not end this one"
+    (let ((p (web-captured)))
+      (playtest-dispatch! p "playtest" "cancel")
+      (playtest-dispatch! p "playtest" "capture")
+      (with-output-to-string (lambda () (playtest-after-frame! p 8 8)))
+      (playtest-dispatch! p "playtest" "opened")
+      (with-output-to-string (lambda () (playtest-dispatch! p "playtest" "saved reports/old")))
+      ;; the stale answer is recorded as said, but only because this report is the
+      ;; one awaited does it end; the page ties answers to their capture as well
+      (assert-false (playtest-busy? p))))
+  (test "a stale answer while idle changes nothing but the message"
+    (let ((p (fresh 'web)))
+      (with-output-to-string (lambda () (playtest-dispatch! p "playtest" "saved reports/old")))
+      (assert-false (playtest-busy? p))
+      (assert-equal 'idle (playtest-phase p))))
+  (test "turning the playtest off drops a report being made"
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) #f))
+      (playtest-key! p 'f2)
+      (playtest-after-frame! p 4 4)
+      (playtest-type! p #\x)
+      (playtest-set-enabled! p #f)
+      (playtest-set-enabled! p #t)
+      (assert-equal 'idle (playtest-phase p))
+      (assert-equal "" (playtest-note p))))
+  (test "a failed save keeps the note, so Enter can try again"
+    (set-store-root! "/dev/null/cannot-be-a-directory")
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) #f))
+      (playtest-key! p 'f2)
+      (playtest-after-frame! p 4 4)
+      (playtest-type! p #\k)
+      (with-output-to-string (lambda () (playtest-key! p 'return)))
+      (assert-equal 'note (playtest-phase p))
+      (assert-equal "k" (playtest-note p))
+      (assert-true (string-contains? (playtest-message p) "NOT saved"))))
+  (test "an infinite value in the description is shown, not raised"
+    (let ((p (make-playtest enabled: #t describe: (lambda () (list (cons 'speed (* 1e300 1e300)) (cons 'room "a"))))))
+      (let ((ls (playtest-readout-lines p 80)))
+        (assert-true (string-contains? (cadr ls) "room a"))))))

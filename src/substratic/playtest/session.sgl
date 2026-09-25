@@ -41,14 +41,17 @@
 ;;; store)'s: ~/.local/share/<game>/reports/... on Linux.
 ;;;
 ;;; ON THE WEB the page does the parts a browser does better
-;;; (web/substratic.js): at F2 (or its report button, for phones) the game
+;;; (assets/substratic/substratic.js): at F2 (or its report button, for phones) the game
 ;;; prints one console line, "substratic: playtest capture JSON"; in the
 ;;; same task, before the browser composites, the page takes the canvas as
 ;;; a PNG, opens an HTML text field over the canvas (so a phone brings up
 ;;; its keyboard), and POSTs the report, the note and the PNG to the dev
 ;;; server (tools/serve.mjs), which writes the same two files. The page
-;;; tells the game ("playtest", "saved DIR"), ("playtest", "failed WHY") or
-;;; ("playtest", "cancel").
+;;; tells the game ("playtest", "opened") when its field is up, then
+;;; ("playtest", "saved DIR"), ("playtest", "failed WHY") or ("playtest",
+;;; "cancel"). If "opened" does not come within PAGE-WAIT-FRAMES (a page
+;;; without substratic.js), the report is given up and play goes on; an
+;;; Escape that reaches the game in that time gives it up at once.
 ;;;
 ;;; Dev-only by default: a playtest starts disabled. The game enables it
 ;;; from a flag (--playtest, ?playtest) or its dev build. Disabled, every
@@ -96,6 +99,7 @@
     (define CAPTURE-PREFIX "substratic: playtest capture ")
     (define NOTE-MAX 200)
     (define MESSAGE-FRAMES 240)          ; how long "report saved" stays up
+    (define PAGE-WAIT-FRAMES 180)        ; web: frames for the page to open its note field
 
     (define-struct playtest
       (game default: "game")
@@ -109,7 +113,8 @@
       (room-tick default: #f mutable: #t)
       (log default: '() mutable: #t)       ; ((tick . input) ...), newest first
       (last-input default: #f mutable: #t)
-      (phase default: 'idle mutable: #t)   ; idle, pending, note (desktop), page (web)
+      (phase default: 'idle mutable: #t)   ; idle, pending, note (desktop), page-wait and page (web)
+      (waited default: 0 mutable: #t)      ; frames spent in page-wait
       (taken default: #f mutable: #t)      ; the report's alist, taken at F2
       (pixels default: #f mutable: #t)     ; the screenshot as PNG bytes, or #f
       (note default: "" mutable: #t)
@@ -128,7 +133,11 @@
                 describe: describe snapshot: snapshot enabled: enabled))
 
     (define (playtest-enabled? p) (playtest-enabled p))
-    (define (playtest-set-enabled! p on) (set-playtest-enabled! p (and on #t)))
+    ;; Turning it off drops any report being made, so turning it on again
+    ;; never lands inside an old note.
+    (define (playtest-set-enabled! p on)
+      (unless on (clear! p))
+      (set-playtest-enabled! p (and on #t)))
     (define (playtest-readout? p) (and (playtest-enabled p) (playtest-readout p)))
     (define (playtest-set-readout! p on) (set-playtest-readout! p (and on #t)))
     (define (playtest-busy? p) (and (playtest-enabled p) (not (eq? (playtest-phase p) 'idle))))
@@ -157,9 +166,14 @@
 
     ;; --- values as text ----------------------------------------------------------
 
+    ;; One decimal; a whole number without it. Infinities and NaN are
+    ;; written as Sigil writes them (exact would raise on them), as is any
+    ;; float too large to scale by ten.
     (define (round-1 x)
-      (let ((r (/ (round (* x 10.0)) 10.0)))
-        (if (= r (round r)) (number->string (exact (round r))) (number->string r))))
+      (if (not (and (= x x) (< (abs x) 1e300)))
+          (number->string x)
+          (let ((r (/ (round (* x 10.0)) 10.0)))
+            (if (= r (round r)) (number->string (exact (round r))) (number->string r)))))
 
     (define (written d) (with-output-to-string (lambda () (write d))))
 
@@ -216,7 +230,11 @@
                                  (if (playtest-room-tick p)
                                      (string-append " (room +" (number->string (- (playtest-tick p) (playtest-room-tick p))) ")")
                                      "")))
-            (parts (map (lambda (e) (string-append (atom->string (car e)) " " (format-value (cdr e))))
+            ;; each entry formatted on its own: one that cannot be shown says
+            ;; so, and never takes the frame down
+            (parts (map (lambda (e)
+                          (guard (x (#t (string-append (atom->string (car e)) " ?")))
+                            (string-append (atom->string (car e)) " " (format-value (cdr e)))))
                         (describe-safely p))))
         (cons (clip head cols) (pack parts cols))))
 
@@ -284,12 +302,21 @@
       (when (> (playtest-message-left p) 0)
         (set-playtest-message-left! p (- (playtest-message-left p) 1))
         (when (= (playtest-message-left p) 0) (set-playtest-message! p #f)))
+      ;; web: the page has PAGE-WAIT-FRAMES to say it opened its note field;
+      ;; without a page that answers (no substratic.js, a missed console
+      ;; line) the game would otherwise wait for it forever
+      (when (and (playtest-enabled p) (eq? (playtest-phase p) 'page-wait))
+        (set-playtest-waited! p (+ (playtest-waited p) 1))
+        (when (> (playtest-waited p) PAGE-WAIT-FRAMES)
+          (clear! p)
+          (say! p "report NOT saved: the page did not open a note (is substratic.js loaded?)")))
       (when (and (playtest-enabled p) (eq? (playtest-phase p) 'pending))
         (if (eq? (playtest-platform p) 'web)
             (begin
               (display (string-append CAPTURE-PREFIX (datum->json (playtest-taken p))))
               (newline)
-              (set-playtest-phase! p 'page))
+              (set-playtest-waited! p 0)
+              (set-playtest-phase! p 'page-wait))
             (let ((png (guard (e (#t #f)) (read-png p w h))))
               (set-playtest-pixels! p png)
               (set-playtest-phase! p 'note)))))
@@ -333,7 +360,8 @@
     (define (playtest-save! p)
       (when (eq? (playtest-phase p) 'note)
         (let ((dir (write-report! p)))
-          (clear! p)
+          ;; a failed save keeps the note open: Enter tries again, Escape discards
+          (when dir (clear! p))
           (when dir
             (set-playtest-last-dir! p dir)
             (say! p (string-append "report saved " dir))
@@ -378,21 +406,32 @@
             ((string=? type "keydown")
              (cond ((string=? payload "F1") (playtest-key! p 'f1))
                    ((string=? payload "F2") (playtest-key! p 'f2))
+                   ;; a key reaching the game while the page should be
+                   ;; showing its note means no note is showing: Escape
+                   ;; gives up rather than waiting out PAGE-WAIT-FRAMES
+                   ((and (string=? payload "Escape") (eq? (playtest-phase p) 'page-wait))
+                    (playtest-cancel! p)
+                    #t)
                    (else (playtest-busy? p))))
             ((string=? type "keyup")
              (or (string=? payload "F1") (string=? payload "F2") (playtest-busy? p)))
             ((string=? type "playtest")
              (cond ((string=? payload "readout") (set-playtest-readout! p (not (playtest-readout p))))
                    ((string=? payload "capture") (playtest-capture! p))
-                   ((string=? payload "cancel") (playtest-cancel! p))
+                   ((string=? payload "opened")
+                    (when (eq? (playtest-phase p) 'page-wait) (set-playtest-phase! p 'page)))
+                   ((string=? payload "cancel")
+                    (when (memq (playtest-phase p) '(page-wait page)) (playtest-cancel! p)))
+                   ;; an answer is taken only while one is awaited: a late
+                   ;; answer to an earlier report must not end this one
                    ((string-starts-with? payload "saved ")
-                    (clear! p)
+                    (when (memq (playtest-phase p) '(page-wait page)) (clear! p))
                     (set-playtest-last-dir! p (substring payload 6 (string-length payload)))
                     (say! p (string-append "report saved " (playtest-last-dir p)))
                     (display (string-append "substratic: playtest report " (playtest-last-dir p)))
                     (newline))
                    ((string-starts-with? payload "failed ")
-                    (clear! p)
+                    (when (memq (playtest-phase p) '(page-wait page)) (clear! p))
                     (say! p (string-append "report NOT saved: " (substring payload 7 (string-length payload))))))
              #t)
             (else #f)))

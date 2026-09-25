@@ -25,16 +25,20 @@
 ;; After link-web-application: the page stamped, and a version.json for the
 ;; update line (the demo's own version, with a summary to show as "new in").
 (define (stamp-web ctx)
+  (let ((stamp (build-stamp)))   ; once: a dirty tree's stamp carries the second
+    (stamp-web* ctx stamp)))
+
+(define (stamp-web* ctx stamp)
   (let* ((out (config-output-dir (context-config ctx)))
          (page-path (path-join out "index.html"))
          (page (read-file-string page-path)))
     (write-file-string page-path
-                       (string-replace (string-replace page "__VERSION__" (build-stamp))
+                       (string-replace (string-replace page "__VERSION__" stamp)
                                        "__TITLE__" "Substratic demo"))
     (write-file-string (path-join out "version.json")
-                       (string-append "{\"version\":\"0.1.0\",\"stamp\":\"" (build-stamp)
+                       (string-append "{\"version\":\"0.1.0\",\"stamp\":\"" stamp
                                       "\",\"summary\":\"The first demo: six rooms, six gems, and F2.\"}\n"))
-    (display "  web stamp ") (display (build-stamp)) (newline)
+    (display "  web stamp ") (display stamp) (newline)
     ctx))
 
 (package

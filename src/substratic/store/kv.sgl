@@ -24,7 +24,7 @@
                   (sigil fs)
                   (sigil process))))
 
-  (export store-root set-store-root! set-store-app!
+  (export store-root set-store-root! set-store-app! set-store-prefix!
           store-get store-set! store-remove!
           store-read-datum store-write-datum!
           datum->text text->datum)
@@ -36,6 +36,14 @@
     ;; The data directory's name under the user data directory (native),
     ;; set by the game before the first store call.
     (define *app* "sigil-game")
+
+    ;; Web only: a prefix for every localStorage key. Pages on one origin
+    ;; share one localStorage, so two games there (site/a and site/b) would
+    ;; share "settings-version" and "update-seen" without one. Off by
+    ;; default, because a game that already has players keeps its keys where
+    ;; they are: turning a prefix on moves every key, and old saves with it.
+    (define *prefix* "")
+    (define (set-store-prefix! p) (set! *prefix* p))
 
     (define (set-store-app! name)
       (set! *app* name)
@@ -60,15 +68,15 @@
 
        (define (store-get key)
          (guard (e (else #f))
-           (local-storage-get key)))
+           (local-storage-get (string-append *prefix* key))))
 
        (define (store-set! key text)
          (guard (e (else #f))
-           (local-storage-set! key text)))
+           (local-storage-set! (string-append *prefix* key) text)))
 
        (define (store-remove! key)
          (guard (e (else #f))
-           (local-storage-remove! key))))
+           (local-storage-remove! (string-append *prefix* key)))))
 
       (else
        ;; The user data directory, by the first variable set: XDG_DATA_HOME

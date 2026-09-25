@@ -143,7 +143,10 @@
         }
       }
     }
-    e.preventDefault();
+    // the loader turns a single-touch drag anywhere into an arrow-key pulse
+    // (its swipe detector listens on the document): the sticks' touches
+    // must never reach it
+    e.preventDefault(); e.stopPropagation();
   }
   function onTouchMove(e) {
     for (var i = 0; i < e.changedTouches.length; i++) {
@@ -155,9 +158,10 @@
         s.touch.dx = dx; s.touch.dy = dy; show(s); sendStick(s);
       });
     }
-    e.preventDefault();
+    e.preventDefault(); e.stopPropagation();
   }
   function onTouchEnd(e) {
+    e.stopPropagation();
     for (var i = 0; i < e.changedTouches.length; i++) {
       var t = e.changedTouches[i];
       sticks.forEach(function (s) {
@@ -200,6 +204,9 @@
   }
 
   // ---- playtest --------------------------------------------------------------------------
+  // One capture at a time. Each has its own object; an answer from the server
+  // acts only if its capture is still the open one, so a late reply to a
+  // cancelled report cannot close or end the next.
   var note = null, noteInput = null, noteImg = null, capture = null;
   function buildNote() {
     note = document.createElement("div"); note.id = "sub-note";
@@ -212,8 +219,9 @@
     ["keydown", "keyup", "keypress"].forEach(function (n) {
       note.addEventListener(n, function (e) {
         e.stopPropagation();
-        if (n === "keydown" && e.key === "Enter") { e.preventDefault(); submit(); }
-        if (n === "keydown" && e.key === "Escape") { e.preventDefault(); cancel(); }
+        if (n !== "keydown" || e.isComposing) return;     // an IME's Enter ends the word, not the note
+        if (e.key === "Enter") { e.preventDefault(); submit(); }
+        if (e.key === "Escape") { e.preventDefault(); cancel(); }
       });
     });
     ["pointerdown", "touchstart", "touchmove", "touchend"].forEach(function (n) {
@@ -224,9 +232,10 @@
   }
   function status(text) { note.querySelector("span").textContent = text; }
   function openNote(reportText) {
+    if (capture) return;                                   // one at a time
     var png = null;
     try { png = canvasEl().toDataURL("image/png"); } catch (err) { console.log("substratic: playtest screenshot failed " + err.message); }
-    capture = { report: reportText, png: png };
+    capture = { report: reportText, png: png, sending: null };
     if (!note) buildNote();
     noteImg.src = png || "";
     noteImg.style.display = png ? "block" : "none";
@@ -234,27 +243,38 @@
     status("");
     note.style.display = "block";
     noteInput.focus();
+    send("playtest", "opened");
   }
   function closeNote() { note.style.display = "none"; capture = null; var c = canvasEl(); if (c && c.focus) c.focus(); }
-  function cancel() { if (!capture) return; closeNote(); send("playtest", "cancel"); }
-  function submit() {
+  function cancel() {
     if (!capture) return;
+    if (capture.sending) capture.sending.abort();
+    closeNote(); send("playtest", "cancel");
+  }
+  function submit() {
+    if (!capture || capture.sending) return;               // Enter twice is one report
+    var mine = capture;
     var report;
-    try { report = JSON.parse(capture.report); } catch (err) { report = { unparsed: capture.report }; }
+    try { report = JSON.parse(mine.report); } catch (err) { report = { unparsed: mine.report }; }
     report.note = noteInput.value;
-    report.screenshot = capture.png ? "screenshot.png" : null;
+    report.screenshot = mine.png ? "screenshot.png" : null;
     var meta = document.querySelector('meta[name="substratic-version"]');
     report.page = { url: location.href, build: meta ? meta.content : null, userAgent: navigator.userAgent, dpr: window.devicePixelRatio || 1,
                     width: window.innerWidth, height: window.innerHeight };
     status("saving...");
-    var body = JSON.stringify({ report: report, png: capture.png });
-    fetch(cfg.reportUrl, { method: "POST", headers: { "content-type": "application/json" }, body: body })
+    mine.sending = new AbortController();
+    var body = JSON.stringify({ report: report, png: mine.png });
+    fetch(cfg.reportUrl, { method: "POST", headers: { "content-type": "application/json" }, body: body, signal: mine.sending.signal })
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
       .then(function (res) {
         if (!res.ok || !res.j.dir) throw new Error((res.j && res.j.error) || "the server said no");
+        if (capture !== mine) return;
         closeNote(); send("playtest", "saved " + res.j.dir);
       })
-      .catch(function (err) { closeNote(); send("playtest", "failed " + (err.message || String(err))); });
+      .catch(function (err) {
+        if (capture !== mine) return;
+        closeNote(); send("playtest", "failed " + (err.message || String(err)));
+      });
   }
   if (playtestOn) {
     send("param", "playtest-page");  // the page can take reports

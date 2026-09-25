@@ -53,9 +53,9 @@
             (let* ((c (clock-advance c dt)) (t (tween-after-frame t c)))
               (loop (+ f 1) c t (or at15 (and (= (clock-ticks c) 15) (tween-value t 0.0))))))))
 
-    (define ROWS
+    (define SELFTEST-ROWS
       (list (setting id: 'music name: "MUSIC" values: (list 'on 'off) default: 'on key: "selftest-music")))
-    (define TABLE (make-settings-table ROWS version: 1 version-key: "selftest-settings-version"))
+    (define TABLE (make-settings-table SELFTEST-ROWS version: 1 version-key: "selftest-settings-version"))
 
     ;; (name . thunk): a thunk answers #t, or a string saying what was wrong.
     (define CHECKS
@@ -89,7 +89,9 @@
               (lambda () (let* ((s (settings-load TABLE)) (s2 (settings-step TABLE s 'music 1)))
                            (settings-save! TABLE s2 'music)
                            (let ((back (settings-value TABLE (settings-load TABLE) 'music)))
-                             (settings-save! TABLE s 'music)
+                             ;; leave no keys behind (on the web they are the player's localStorage)
+                             (store-remove! "selftest-music")
+                             (store-remove! "selftest-settings-version")
                              (or (eq? back 'off) "the setting did not stick")))))
         (cons "version-compare"
               (lambda () (or (and (= (version-compare "0.1.10" "0.1.9") 1)

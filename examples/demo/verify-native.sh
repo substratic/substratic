@@ -4,7 +4,8 @@
 #
 #   open     the window opens at x2 of the 320x176 view (640x352)
 #   selftest the engine's checks pass inside the binary (--selftest)
-#   move     holding D moves the player (the readout's position changes)
+#   move     with no key the location line of the readout holds still;
+#            holding D changes it
 #   report   F2, a typed note, Enter: report.json and screenshot.png land
 #            under $XDG_DATA_HOME/substratic-demo/reports/, the note and the
 #            location are in the JSON, the PNG is 640x352, valid (ImageMagick
@@ -80,15 +81,21 @@ sleep 3
 geo="$($X getwindowgeometry "$XID" | awk '/Geometry/ {print $2}')"
 [ "$geo" = "640x352" ] && pass "open 640x352" || fail open "geometry $geo"
 
+# The readout's second line (y 13..20 at text scale 1) is the location:
+# region, room, cell, position. The first line carries the tick, which
+# changes every frame, so it is left out. Control: with no key held the
+# location line holds still; then holding D changes it.
+line2() { $IM convert "$1" -crop 640x8+0+13 +repage -format '%#' info:-; }
 $X windowfocus --sync "$XID" key F1
 sleep 1
-$IM import -window "$XID" "$WORK/before.png"
+$IM import -window "$XID" "$WORK/still-1.png"
+sleep 1
+$IM import -window "$XID" "$WORK/still-2.png"
+[ "$(line2 "$WORK/still-1.png")" = "$(line2 "$WORK/still-2.png")" ] && pass "move control (no key, the location line holds still)" || fail move "the location line changed with no key held"
 $X windowfocus --sync "$XID" keydown d; sleep 1.5; $X keyup d
 sleep 1
 $IM import -window "$XID" "$WORK/after.png"
-top_before="$($IM convert "$WORK/before.png" -crop 640x40+0+0 +repage -format '%#' info:-)"
-top_after="$($IM convert "$WORK/after.png" -crop 640x40+0+0 +repage -format '%#' info:-)"
-[ "$top_before" != "$top_after" ] && pass "move (the readout changed)" || fail move "the readout did not change"
+[ "$(line2 "$WORK/still-2.png")" != "$(line2 "$WORK/after.png")" ] && pass "move (holding D changed the location line)" || fail move "the location line did not change"
 
 # F2, a note, Enter
 $X windowfocus --sync "$XID" key F2

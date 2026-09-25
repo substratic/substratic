@@ -47,18 +47,29 @@
 
     ;; --- comparing versions --------------------------------------------------
 
-    ;; "0.1.10" -> (0 1 10); a part that is not a number stays a string
-    ;; ("1.0.0-rc1" -> (1 0 "0-rc1")).
-    (define (version-parts v)
-      (map (lambda (p) (or (string->number p) p)) (string-split v ".")))
+    ;; A part as (number . tag): "10" -> (10 . ""), "0-rc1" -> (0 . "-rc1"),
+    ;; "beta" -> (#f . "beta").
+    (define (part-split p)
+      (let loop ((i 0))
+        (if (and (< i (string-length p)) (char-numeric? (string-ref p i)))
+            (loop (+ i 1))
+            (cons (and (> i 0) (string->number (substring p 0 i)))
+                  (substring p i (string-length p))))))
 
+    (define (version-parts v)
+      (map part-split (string-split v ".")))
+
+    ;; The numbers first; at equal numbers a plain part is newer than a
+    ;; tagged one ("1.0.0" > "1.0.0-rc1"), and two tags compare as text.
     (define (part-compare a b)
-      (cond ((and (number? a) (number? b)) (cond ((< a b) -1) ((> a b) 1) (else 0)))
-            ((number? a) 1)          ; a plain number is newer than a tagged one
-            ((number? b) -1)
-            ((string<? a b) -1)
-            ((string<? b a) 1)
-            (else 0)))
+      (let ((na (or (car a) -1)) (nb (or (car b) -1)) (ta (cdr a)) (tb (cdr b)))
+        (cond ((< na nb) -1)
+              ((> na nb) 1)
+              ((and (string=? ta "") (not (string=? tb ""))) 1)
+              ((and (string=? tb "") (not (string=? ta ""))) -1)
+              ((string<? ta tb) -1)
+              ((string<? tb ta) 1)
+              (else 0))))
 
     ;; -1, 0 or 1 as a is older than, the same as, or newer than b. Missing
     ;; trailing parts count as 0 ("0.2" = "0.2.0").
@@ -66,7 +77,7 @@
       (let loop ((pa (version-parts a)) (pb (version-parts b)))
         (cond ((and (null? pa) (null? pb)) 0)
               (else
-               (let ((c (part-compare (if (null? pa) 0 (car pa)) (if (null? pb) 0 (car pb)))))
+               (let ((c (part-compare (if (null? pa) (cons 0 "") (car pa)) (if (null? pb) (cons 0 "") (car pb)))))
                  (if (= c 0)
                      (loop (if (null? pa) '() (cdr pa)) (if (null? pb) '() (cdr pb)))
                      c))))))))

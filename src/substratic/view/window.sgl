@@ -1,10 +1,11 @@
 ;;; (substratic view window) - A desktop window at whole-number scales of
 ;;; the view, remembered between runs.
 ;;;
-;;; The window opens at a remembered whole scale of the view (x2 the first
-;;; time: small, like a handheld's screen, and 1x is too small on a HiDPI
-;;; display). A window resized by hand snaps to the whole scale it fits,
-;;; never below the minimum, and that scale is remembered. F11 or Alt+Enter
+;;; The window opens at a remembered whole scale of the view (the first
+;;; time, the minimum: x2 by default, small like a handheld's screen, since
+;;; 1x is too small on a HiDPI display). A window resized by hand snaps to
+;;; the whole scale it fits, never below the minimum, and that scale is
+;;; remembered. F11 or Alt+Enter
 ;;; toggles fullscreen, which is remembered too. The view itself is fitted
 ;;; every frame by (substratic view fit) with integer-only: #t, so whatever
 ;;; size the window ends up, the view is drawn at the largest whole scale
@@ -37,7 +38,7 @@
 ;;; the window reports it through a callback as a symbol, 'x2 .. 'x8 or
 ;;; 'fullscreen, and takes it back at open with window-open-scale.
 ;;;
-;;; Extracted from Harkfell's native shell, where D37 was built and driven
+;;; Extracted from Harkfell's native shell, where this was built and driven
 ;;; on Xvfb, sway and a HiDPI screen. On the web every call is a no-op: a
 ;;; page fits its canvas.
 
@@ -84,7 +85,8 @@
            (let ((s (symbol->string v)))
              (and (> (string-length s) 1)
                   (char=? (string-ref s 0) #\x)
-                  (string->number (substring s 1 (string-length s)))))))
+                  (let ((k (string->number (substring s 1 (string-length s)))))
+                    (and (exact-integer? k) k))))))
 
     ;; The whole scale to open at, from the remembered symbol (#f the first
     ;; time). A remembered 'fullscreen opens at the minimum and goes

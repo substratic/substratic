@@ -47,7 +47,9 @@
                  ;; before the playtest reads this frame's keys: an Escape
                  ;; that closes the note must not also quit
                  (was-busy (playtest-busy? pt)))
-            (window-scaler-frame! scaler)
+            ;; while a note is open its keys are the note's: Alt+Enter must not
+            ;; also toggle fullscreen
+            (unless was-busy (window-scaler-frame! scaler))
             (playtest-frame! pt)
             (unless (or was-busy (playtest-busy? pt))
               (keys-poll! (core-keys) KEYS)

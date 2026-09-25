@@ -78,7 +78,12 @@ const errors = [];
 ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.id && waiting.has(m.id)) { waiting.get(m.id)(m); waiting.delete(m.id); return; }
-  if (m.method === "Runtime.consoleAPICalled") lines.push(m.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
+  if (m.method === "Runtime.consoleAPICalled") {
+    const text = m.params.args.map((a) => a.value ?? a.description ?? "").join(" ");
+    lines.push(text);
+    // the loader reports a handler's failure with console.error, not a throw
+    if (m.params.type === "error") errors.push(`console.error: ${text}`);
+  }
   if (m.method === "Runtime.exceptionThrown") errors.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
 };
 function cdp(method, params = {}) {
@@ -138,10 +143,16 @@ await sleep(1500);
 await cdp("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 await sleep(300);
 
-// ---- the key trace's positive control: a key outside the note reaches the game --------------
+// ---- the loader's key dispatches, watched below the game --------------------------
+// A spy on the app's dispatch records every keydown the loader delivers,
+// before any game-side guard can hide it. q, pressed outside the note, must
+// show up (the positive control); the note's typing must not.
+await evaluate(`(() => { const a = globalThis.SigilWebApp; window.__keys = []; const d = a.dispatch.bind(a);
+  a.dispatch = function (t, p) { if (t === "keydown") window.__keys.push(p); return d(t, p); }; return true; })()`);
 await key("q", "KeyQ", 81);
-if (await waitLine((l) => l === "substratic-demo: key q", 3000)) pass("a key outside the note reaches the game (the trace works)");
-else fail("keys", "the positive control: q never reached the game, so the note's leak check below would prove nothing");
+await sleep(200);
+if ((await evaluate("window.__keys")).includes("q")) pass("a key outside the note reaches the loader's dispatch (the spy works)");
+else fail("keys", "the positive control: q never reached the dispatch, so the note's leak check below would prove nothing");
 
 // ---- F2, a note, Enter -------------------------------------------------------------------
 await key("F2", "F2", 113);
@@ -150,7 +161,7 @@ if (!cap) fail("report", "no capture line");
 await sleep(300);
 const noteOpen = await evaluate("(() => { const n = document.getElementById('sub-note'); return !!n && n.style.display === 'block' && document.activeElement === n.querySelector('input'); })()");
 if (noteOpen) pass("the note field is open and focused"); else fail("report", "the note field is not open and focused");
-const linesBefore = lines.length;
+const keysBefore = (await evaluate("window.__keys")).length;
 // typed key by key (insertText fires no keydown, and the leak check needs them)
 for (const c of "web: the gem is stuck") {
   await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: c, text: c, unmodifiedText: c });
@@ -168,7 +179,7 @@ else {
   if (r.note === "web: the gem is stuck") pass("report note"); else fail("report note", JSON.stringify(r.note));
   if (r.platform === "web" && r.location && r.location.room) pass(`report location (${r.location.room})`); else fail("report location", JSON.stringify(r.location));
   const x = r.location && r.location.position && r.location.position[0];
-  if (typeof x === "number" && x > 170) pass(`the stick moved the player (x ${x})`); else fail("stick", `position ${JSON.stringify(r.location && r.location.position)}`);
+  if (typeof x === "number" && x > 200) pass(`the stick moved the player (x ${x})`); else fail("stick", `position ${JSON.stringify(r.location && r.location.position)}`);
   if (r.page && r.page.build && r.page.build !== "__VERSION__") pass(`report build ${r.page.build}`); else fail("report build", JSON.stringify(r.page));
   const png = fs.readFileSync(path.join(d, "screenshot.png"));
   const canvas = await evaluate("[document.querySelector('#stage').width, document.querySelector('#stage').height]");
@@ -176,7 +187,7 @@ else {
   if (info.w === canvas[0] && info.h === canvas[1]) pass(`screenshot ${info.w}x${info.h}, the canvas's size`); else fail("screenshot", `${info.w}x${info.h} against canvas ${canvas}`);
   if (info.lit > 0.2) pass(`screenshot not blank (${(info.lit * 100).toFixed(0)}% of pixels lit)`); else fail("screenshot", `only ${(info.lit * 100).toFixed(1)}% of pixels lit`);
 }
-const leaked = lines.slice(linesBefore).filter((l) => l.startsWith("substratic-demo: key"));
+const leaked = (await evaluate("window.__keys")).slice(keysBefore);
 if (leaked.length === 0) pass("the note's typing never reached the game"); else fail("keys", leaked.join("; "));
 if (errors.length === 0) pass("no uncaught error"); else fail("console", errors.slice(0, 3).join(" | "));
 

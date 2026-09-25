@@ -119,9 +119,17 @@
                      (if (and (<= (+ i m) n) (string=? (substring text i (+ i m)) word))
                          (cons value (+ i m))
                          (fail))))
+                 ;; exactly four hex digits (string->number would also take a
+                 ;; sign or a radix prefix)
+                 (define (hex-digit c)
+                   (cond ((and (char>=? c #\0) (char<=? c #\9)) (- (char->integer c) 48))
+                         ((and (char>=? c #\a) (char<=? c #\f)) (- (char->integer c) 87))
+                         ((and (char>=? c #\A) (char<=? c #\F)) (- (char->integer c) 55))
+                         (else (fail))))
                  (define (hex-at i)
                    (if (<= (+ i 4) n)
-                       (or (string->number (substring text i (+ i 4)) 16) (fail))
+                       (let loop ((k 0) (v 0))
+                         (if (= k 4) v (loop (+ k 1) (+ (* v 16) (hex-digit (string-ref text (+ i k)))))))
                        (fail)))
                  (define (read-string i)       ; i: just after the opening quote
                    (let ((out (open-output-string)))
@@ -141,10 +149,15 @@
                                     ((#\r) (write-char #\return out) (loop (+ i 2)))
                                     ((#\t) (write-char #\tab out) (loop (+ i 2)))
                                     ((#\u)
-                                     (let ((u (hex-at (+ i 2))))
-                                       (if (and (>= u #xD800) (<= u #xDBFF)
-                                                (eqv? (peek (+ i 6)) #\\) (eqv? (peek (+ i 7)) #\u))
-                                           (let ((lo (hex-at (+ i 8))))
+                                     ;; a high surrogate pairs only with a low one
+                                     ;; (DC00..DFFF); any lone half is U+FFFD
+                                     (let* ((u (hex-at (+ i 2)))
+                                            (lo (and (>= u #xD800) (<= u #xDBFF)
+                                                     (eqv? (peek (+ i 6)) #\\) (eqv? (peek (+ i 7)) #\u)
+                                                     (let ((l (hex-at (+ i 8))))
+                                                       (and (>= l #xDC00) (<= l #xDFFF) l)))))
+                                       (if lo
+                                           (begin
                                              (write-char (integer->char (+ #x10000 (* (- u #xD800) 1024) (- lo #xDC00))) out)
                                              (loop (+ i 12)))
                                            (begin
@@ -153,13 +166,23 @@
                                     (else (fail)))))
                                ((< (char->integer c) 32) (fail))
                                (else (write-char c out) (loop (+ i 1))))))))
+                 ;; JSON's grammar: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+                 ;; (string->number alone takes +1, .5, 1. and 01 too)
+                 (define (digit? j) (let ((c (peek j))) (and c (char-numeric? c))))
+                 (define (digits j)                 ; one or more; the index after
+                   (if (digit? j)
+                       (let loop ((j (+ j 1))) (if (digit? j) (loop (+ j 1)) j))
+                       (fail)))
                  (define (read-number i)
-                   (let loop ((j i))
-                     (let ((c (peek j)))
-                       (if (and c (or (char-numeric? c) (memv c '(#\- #\+ #\. #\e #\E))))
-                           (loop (+ j 1))
-                           (let ((v (and (> j i) (string->number (substring text i j)))))
-                             (if v (cons v j) (fail)))))))
+                   (let* ((j (if (eqv? (peek i) #\-) (+ i 1) i))
+                          (j (cond ((eqv? (peek j) #\0) (+ j 1))
+                                   (else (digits j))))
+                          (j (if (and (eqv? (peek j) #\.)) (digits (+ j 1)) j))
+                          (j (if (memv (peek j) '(#\e #\E))
+                                 (digits (if (memv (peek (+ j 1)) '(#\+ #\-)) (+ j 2) (+ j 1)))
+                                 j))
+                          (v (string->number (substring text i j))))
+                     (if v (cons v j) (fail))))
                  (define (read-array i)        ; i: just after [
                    (let ((i (skip i)))
                      (if (eqv? (peek i) #\])

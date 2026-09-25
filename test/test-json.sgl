@@ -61,3 +61,18 @@
   (test "what the writer writes, the reader reads"
     (let ((d (list (cons 'game "demo") (cons 'cell (vector 4 7)) (cons 'ok #t) (cons 'n 'null))))
       (assert-equal d (json->datum (datum->json d))))))
+
+(test-group "json: what the reader refuses, without raising"
+  (test "numbers outside JSON's grammar"
+    (for-each (lambda (t) (assert-false (json->datum t)))
+              (list "+1" ".5" "1." "01" "-.5" "1e" "1e+" "-" "--1" "0x10")))
+  (test "numbers inside it"
+    (assert-equal -50.0 (json->datum "-0.5e+2"))
+    (assert-equal 0 (json->datum "0"))
+    (assert-equal 1200.0 (json->datum "12E2")))
+  (test "a \\u escape that is not four hex digits"
+    (for-each (lambda (t) (assert-false (json->datum t)))
+              (list "\"\\u-001\"" "\"\\u+041\"" "\"\\u#x41\"" "\"\\u12\"" "\"\\uzzzz\"")))
+  (test "a high surrogate without a low one is U+FFFD, never an error"
+    (assert-equal 65533 (char->integer (string-ref (json->datum "\"\\udbff\\uffff\"") 0)))
+    (assert-equal 65533 (char->integer (string-ref (json->datum "\"\\ud800\\u0041\"") 0)))))

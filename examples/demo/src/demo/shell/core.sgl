@@ -57,10 +57,13 @@
     ;; build: the build stamp; platform: 'desktop or 'web.
     (define (core-boot! build platform)
       (set-store-app! GAME-NAME)
+      (set-store-prefix! (string-append GAME-NAME ":"))   ; web: its own localStorage keys
       (set! *pt* (make-playtest game: GAME-NAME build: build platform: platform
                                 describe: (lambda () (describe *world*))
                                 snapshot: (lambda () (snapshot *world*))
-                                enabled: #t))
+                                ;; the desktop demo always has it; the web only
+                                ;; with ?playtest (the page's report buttons too)
+                                enabled: (eq? platform (quote desktop))))
       (set! *updater* (make-updater VERSION platform))
       (playtest-room-entered! *pt* 0))
 

@@ -1,7 +1,7 @@
 ;;; (substratic input sticks) - Touch sticks: their vectors, and two ways
 ;;; to read one.
 ;;;
-;;; The page's touch layer (web/substratic.js) sends each stick as
+;;; The page's touch layer (assets/substratic/substratic.js) sends each stick as
 ;;; ("stick", "NAME,DX,DY"): the thumb's offset from where it landed, in
 ;;; ring radii, dx right and dy DOWN, the length clamped to 1. A stick
 ;;; state keeps the latest vector per name; a lifted thumb sends 0,0.

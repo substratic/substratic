@@ -24,7 +24,16 @@ const [dir, portArg] = args;
 if (!dir || !portArg) { console.error("usage: serve.mjs DIR PORT [--host ADDR] [--tls CERTDIR] [--reports DIR]"); process.exit(2); }
 const port = Number(portArg);
 const host = flag("--host") || "127.0.0.1";
-if (host === "0.0.0.0" || host === "::" || host === "*") { console.error(`serve: refusing to bind to ${host}`); process.exit(2); }
+// Every address that means "all interfaces", however it is written, is
+// refused here and again on the address actually bound (below).
+function unspecified(a) {
+  const s = String(a).toLowerCase().replace(/^\[|\]$/g, "");
+  if (s === "*" || s === "") return true;
+  const v4 = s.replace(/^::ffff:/, "");
+  if (/^[0-9.]+$/.test(v4)) return v4.split(".").every((p) => Number(p) === 0);
+  return /^[0:]+$/.test(s);
+}
+if (unspecified(host)) { console.error(`serve: refusing to bind to ${host}`); process.exit(2); }
 const tlsDir = flag("--tls");
 const root = path.resolve(dir);
 const reports = path.resolve(flag("--reports") || "reports");
@@ -85,9 +94,20 @@ function report(req, res) {
   });
 }
 
+// One bad request must not take the server down: anything the handler
+// throws is a 400 for that request.
 function handler(req, res) {
+  try { handle(req, res); }
+  catch (err) { if (!res.headersSent) { res.writeHead(400); } res.end(); }
+}
+
+function handle(req, res) {
   const u = new URL(req.url, "http://x");
   if (u.pathname.endsWith("/playtest-report")) {
+    // a page from another origin (any site the developer has open) may not
+    // write reports here
+    const origin = req.headers.origin;
+    if (origin && new URL(origin).host !== req.headers.host) return answer(res, 403, { error: "another origin" });
     if (req.method !== "POST") return answer(res, 405, { error: "POST a report" });
     return report(req, res);
   }
@@ -106,4 +126,8 @@ function handler(req, res) {
 const server = tlsDir
   ? https.createServer({ key: fs.readFileSync(path.join(tlsDir, "key.pem")), cert: fs.readFileSync(path.join(tlsDir, "cert.pem")) }, handler)
   : http.createServer(handler);
-server.listen(port, host, () => console.log(`serve: ${tlsDir ? "https" : "http"}://${host}:${port}/ serving ${root}, reports to ${reports}`));
+server.listen(port, host, () => {
+  const bound = server.address().address;
+  if (unspecified(bound)) { console.error(`serve: ${host} bound every interface (${bound}); refusing`); process.exit(2); }
+  console.log(`serve: ${tlsDir ? "https" : "http"}://${host}:${port}/ serving ${root}, reports to ${reports}`);
+});

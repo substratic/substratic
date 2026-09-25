@@ -8,12 +8,13 @@
  * frame's end-frame (the drawing has been submitted) and before the next
  * wait-frame swaps the buffers. GL entry points come from sigil-desktop's
  * proc loader (GLFW's glfwGetProcAddress), as sigil-graphics loads its
- * own, so nothing GL is linked. The read framebuffer binding and the pack
- * alignment are restored after the read, so sokol's cached state stays
- * true.
+ * own, so nothing GL is linked. Every piece of GL state it touches (the
+ * read framebuffer binding, framebuffer 0's read buffer, the pack alignment
+ * and row length) is put back after the read, so sokol's cached state
+ * stays true.
  *
  * On the web the page takes the screenshot from the canvas instead
- * (web/substratic.js), and this answers #f.
+ * (assets/substratic/substratic.js), and this answers #f.
  */
 #include "sigil-internal.h"
 #include <stdint.h>
@@ -46,6 +47,8 @@ typedef GLenum (*pfn_glGetError)(void);
 #define SUB_GL_PACK_ALIGNMENT           0x0D05
 #define SUB_GL_READ_BUFFER              0x0C02
 #define SUB_GL_BACK                     0x0405
+#define SUB_GL_PACK_ROW_LENGTH          0x0D02
+#define SUB_GL_PIXEL_PACK_BUFFER_BINDING 0x88ED
 
 extern void *sigil_desktop_gl_get_proc_address(const char *name);
 
@@ -56,9 +59,12 @@ static Value native_capture_frame(SigilVM *vm, int argc, Value *args)
         sigil__vm_set_error(vm, SIGIL_ERR_TYPE, "%capture-frame: width and height must be integers");
         return SIGIL_UNDEFINED;
     }
-    int w = (int)sigil_as_fixnum(args[0]);
-    int h = (int)sigil_as_fixnum(args[1]);
-    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return SIGIL_FALSE;
+    /* range-checked before narrowing: 2^32+100 must not pass as 100 */
+    int64_t w64 = (int64_t)sigil_as_fixnum(args[0]);
+    int64_t h64 = (int64_t)sigil_as_fixnum(args[1]);
+    if (w64 <= 0 || h64 <= 0 || w64 > 16384 || h64 > 16384) return SIGIL_FALSE;
+    int w = (int)w64;
+    int h = (int)h64;
 
     pfn_glReadPixels read_pixels = (pfn_glReadPixels)sigil_desktop_gl_get_proc_address("glReadPixels");
     pfn_glBindFramebuffer bind_fb = (pfn_glBindFramebuffer)sigil_desktop_gl_get_proc_address("glBindFramebuffer");
@@ -71,21 +77,30 @@ static Value native_capture_frame(SigilVM *vm, int argc, Value *args)
     Value bv = sigil_make_bytevector(vm, (size_t)w * (size_t)h * 4u);
     if (!sigil_is_bytevector(bv)) return SIGIL_FALSE;
 
-    GLint old_fb = 0, old_align = 4, old_read = SUB_GL_BACK;
-    while (get_error() != 0) { /* clear anything pending */ }
+    /* The state touched, saved and put back: the read binding, and on the
+     * default framebuffer its read buffer; the pack alignment and row
+     * length. With a pixel pack buffer bound the read would go into it,
+     * not our memory, so that case answers #f. */
+    GLint old_fb = 0, old_align = 4, old_row = 0, old_read0 = SUB_GL_BACK, pack_buf = 0;
+    for (int i = 0; i < 16 && get_error() != 0; i++) { /* drain, bounded */ }
+    get_int(SUB_GL_PIXEL_PACK_BUFFER_BINDING, &pack_buf);
+    if (pack_buf != 0) return SIGIL_FALSE;
     get_int(SUB_GL_READ_FRAMEBUFFER_BINDING, &old_fb);
     get_int(SUB_GL_PACK_ALIGNMENT, &old_align);
-    get_int(SUB_GL_READ_BUFFER, &old_read);
+    get_int(SUB_GL_PACK_ROW_LENGTH, &old_row);
 
     bind_fb(SUB_GL_READ_FRAMEBUFFER, 0);
+    get_int(SUB_GL_READ_BUFFER, &old_read0);      /* framebuffer 0's own */
     read_buffer(SUB_GL_BACK);
     pixel_store(SUB_GL_PACK_ALIGNMENT, 1);
+    pixel_store(SUB_GL_PACK_ROW_LENGTH, 0);
     read_pixels(0, 0, w, h, SUB_GL_RGBA, SUB_GL_UNSIGNED_BYTE, sigil_bytevector_data(bv));
     GLenum err = get_error();
 
+    read_buffer((GLenum)old_read0);
+    pixel_store(SUB_GL_PACK_ROW_LENGTH, old_row);
     pixel_store(SUB_GL_PACK_ALIGNMENT, old_align);
     bind_fb(SUB_GL_READ_FRAMEBUFFER, (unsigned int)old_fb);
-    if (old_fb != 0) read_buffer((GLenum)old_read);
 
     if (err != 0) return SIGIL_FALSE;
     return bv;
