@@ -1,0 +1,21 @@
+;;; (substratic web params) - The page's URL parameters, as the game gets
+;;; them.
+;;;
+;;; The page template sends every URL parameter, in order, as
+;;; ("param", "KEY=VALUE"), or ("param", "KEY") for a bare ?key; the key and
+;;; value are already percent-decoded. split-param answers (key . value),
+;;; with value #f for a bare key, splitting at the FIRST "=" (so a value may
+;;; hold "="). A key that itself held an encoded "=" cannot be told apart;
+;;; do not name parameters that way.
+
+(define-library (substratic web params)
+  (import (sigil string))
+
+  (export split-param)
+
+  (begin
+    (define (split-param kv)
+      (let ((i (string-index kv (lambda (c) (char=? c #\=)))))
+        (if i
+            (cons (substring kv 0 i) (substring kv (+ i 1) (string-length kv)))
+            (cons kv #f))))))

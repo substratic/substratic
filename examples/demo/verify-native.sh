@@ -52,7 +52,7 @@ trap cleanup EXIT
 
 # selftest first: no window needed
 if out="$(env -u DISPLAY -u WAYLAND_DISPLAY "$BIN" --selftest 2>&1)"; then
-  echo "$out" | grep -q "DONE platform=desktop pass=14 fail=0 of=14" && pass selftest || fail selftest "$(echo "$out" | tail -1)"
+  echo "$out" | grep -q "DONE platform=desktop pass=15 fail=0 of=15" && pass selftest || fail selftest "$(echo "$out" | tail -1)"
 else
   fail selftest "exit $? $(echo "$out" | grep FAIL | head -3 | tr '\n' ' ')"
 fi

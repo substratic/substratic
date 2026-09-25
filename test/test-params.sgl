@@ -1,0 +1,14 @@
+;;; (substratic web params): what the page's ("param", ...) payloads split into.
+
+(import (sigil test)
+        (substratic web params))
+
+(test-group "params: split-param"
+  (test "key and value"
+    (assert-equal (cons "seen" "0.0.9") (split-param "seen=0.0.9")))
+  (test "a bare key has no value"
+    (assert-equal (cons "playtest" #f) (split-param "playtest")))
+  (test "an empty value is not a bare key"
+    (assert-equal (cons "a" "") (split-param "a=")))
+  (test "the first = splits; the value keeps the rest"
+    (assert-equal (cons "a b" "c&d=e") (split-param "a b=c&d=e"))))

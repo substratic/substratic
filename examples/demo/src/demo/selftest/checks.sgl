@@ -28,6 +28,7 @@
           (substratic input keys)
           (substratic input sticks)
           (substratic input events)
+          (substratic web params)
           (substratic store kv)
           (substratic store settings)
           (substratic update version)
@@ -80,6 +81,10 @@
                                     (eq? (stick-sector 0.6 0.0 'none) 'e)
                                     (< (abs (- (cdr (stick-vector st "move")) 0.8)) 1e-9))
                                "input lost"))))
+        (cons "params"
+              (lambda () (or (and (equal? (split-param "seen=0.0.9") (cons "seen" "0.0.9"))
+                                  (equal? (split-param "playtest") (cons "playtest" #f)))
+                             "params split wrong")))
         (cons "store-round-trip"
               (lambda () (store-write-datum! "selftest" '(a "b" 3))
                          (let ((back (store-read-datum "selftest")))

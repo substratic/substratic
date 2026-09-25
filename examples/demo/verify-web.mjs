@@ -115,7 +115,7 @@ await cdp("Page.navigate", { url });
 const ready = await waitLine((l) => l.startsWith("substratic-demo: ready"), 60000);
 if (!ready) { console.log(lines.slice(-20).join("\n")); setupFailed("the game never said ready"); }
 const done = await waitLine((l) => l.startsWith("selftest: DONE"), 30000);
-if (done === "selftest: DONE platform=web pass=14 fail=0 of=14") pass("selftest (14 of 14 in wasm)");
+if (done === "selftest: DONE platform=web pass=15 fail=0 of=15") pass("selftest (15 of 15 in wasm)");
 else fail("selftest", `${done} ${lines.filter((l) => l.startsWith("selftest: FAIL")).join("; ")}`);
 
 for (const p of ["selftest", "playtest", "seen=0.0.9", "trace-color=7", "a b=c&d"]) {
