@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- sigil-graphics `>=0.12.0, <0.14.0` (was `^0.12.0`): a game can take
+  sigil-graphics 0.13 (the text atlas) with Substratic, and one locked to
+  0.12 keeps working. Substratic uses nothing new from it; its own lock
+  and the examples are on 0.13.0.
+
 ## 0.2.0 (2026-09-25)
 
 - `examples/emberlight`: a tiny game made with Substratic, its showcase and

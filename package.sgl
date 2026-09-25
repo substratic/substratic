@@ -42,7 +42,7 @@
     ;; The window, keys and the GL proc loader; native only.
     (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
     ;; Drawing, both targets.
-    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
+    (from-git url: "codeberg:sigil/sigil-graphics" version: ">=0.12.0, <0.14.0")
     ;; Web only: localStorage for (substratic store kv). A game on the web
     ;; lists it too (a dependency's own dependencies are not compiled into
     ;; the game's bundle unless the game lists them, sigil 0.22.7).

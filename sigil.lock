@@ -19,9 +19,9 @@
            version: "0.13.0")
   (package name: "sigil-graphics"
            url: "codeberg:sigil/sigil-graphics"
-           ref: "^0.12.0"
-           sha: "bfcd31eb33a14ee65cffb17430a326caec4acb84"
-           version: "0.12.0")
+           ref: ">=0.12.0, <0.14.0"
+           sha: "67bed815c6076a952ed14a827b0e4c2e36da0cc1"
+           version: "0.13.0")
   (package name: "sigil-browser"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"

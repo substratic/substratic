@@ -95,7 +95,7 @@
   dependencies: (list
     (from-path dir: "../.." package: "substratic")
     (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
-    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
+    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.13.0")
     (from-git url: sigil-repo package: "sigil-wasm-runtime" version: ">=0.22.7" configs: '(web))
     (from-git url: sigil-repo package: "sigil-wasm-gles3" version: ">=0.22.7" configs: '(web))
     (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
