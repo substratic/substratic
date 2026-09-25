@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: 0.2.0
+## 0.2.0 (2026-09-25)
 
 - `examples/emberlight`: a tiny game made with Substratic, its showcase and
   integration test; the six-room demo stays as a test fixture.
