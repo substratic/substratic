@@ -47,7 +47,8 @@
     reportUrl: "playtest-report",
     versionUrl: "version.json",      // null: no update check
     fullscreen: true,
-    gamepad: true                    // the browser's Gamepad API, as ("pad", ...)
+    gamepad: true,                   // the browser's Gamepad API, as ("pad", ...)
+    focus: true                      // ("blur") and ("visibility", ...) on focus changes
   }, window.SUBSTRATIC || {});
 
   var params = new URLSearchParams(location.search);
@@ -98,11 +99,14 @@
   if (params.has("touch")) document.body.classList.add("sub-touch");
 
   // ---- focus ------------------------------------------------------------------
-  window.addEventListener("blur", function () { send("blur", ""); releaseSticks(); });
-  document.addEventListener("visibilitychange", function () {
-    send("visibility", document.visibilityState);
-    if (document.visibilityState === "hidden") { send("blur", ""); releaseSticks(); }
-  });
+  // Off (focus: false) for a page that sends its own focus events.
+  if (cfg.focus) {
+    window.addEventListener("blur", function () { send("blur", ""); releaseSticks(); });
+    document.addEventListener("visibilitychange", function () {
+      send("visibility", document.visibilityState);
+      if (document.visibilityState === "hidden") { send("blur", ""); releaseSticks(); }
+    });
+  }
 
   // ---- sticks -------------------------------------------------------------------
   var R = cfg.stickRadius;
@@ -348,7 +352,7 @@
   withApp(function (a) {
     app = a;
     var c = canvasEl();
-    if (c) {
+    if (c && sticks.length) {           // no sticks, no touch handling: the page's own controls keep theirs
       c.addEventListener("touchstart", onTouchStart, { passive: false });
       c.addEventListener("touchmove", onTouchMove, { passive: false });
       c.addEventListener("touchend", onTouchEnd);

@@ -7,6 +7,8 @@
 - `(substratic store settings)`: `version: #f` makes a table with no schema
   version that never resets, for a game adopting the module with players
   whose settings have no version key.
+- `substratic.js`: a `focus` option (off for a page that sends its own focus
+  events), and no canvas touch handling when a page configures no sticks.
 - `(substratic input pad)`: a gamepad, natively through GLFW's gamepad API
   (a small C native), on the web through the browser's Gamepad API, which
   `substratic.js` now polls and sends as `("pad", ...)`.
