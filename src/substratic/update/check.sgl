@@ -27,11 +27,15 @@
 ;;; failure, a missing field, no network: the status is 'none and nothing
 ;;; blocks.
 ;;;
-;;; Transport. On the web the page (web/substratic.js) fetches version.json
-;;; at boot and hands the text over as ("update-info", TEXT);
-;;; updater-dispatch! takes it and the worker's ("update", "waiting").
-;;; Natively, (substratic update http) fetches it; any text from anywhere
-;;; can be given with updater-set-info!.
+;;; Transport. On the web the page (assets/substratic/substratic.js)
+;;; fetches version.json at boot and hands the text over as
+;;; ("update-info", TEXT); updater-dispatch! takes it and the worker's
+;;; ("update", "waiting"). On the desktop the game fetches the text however
+;;; it likes and gives it to updater-set-info!. No fetch is built in there:
+;;; the HTTP client the ecosystem has (sigil-http, over sigil-tls) blocks
+;;; the calling frame for the whole request, so where and when to pay that
+;;; (before the window opens, on a menu action, on a thread) is the game's
+;;; call.
 ;;;
 ;;; Extracted from Crash The Stack's page fetch of /version.json, which
 ;;; only showed what was waiting (it had a worker to compare for it); the
