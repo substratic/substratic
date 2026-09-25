@@ -1,0 +1,123 @@
+;;; (substratic input pad) - A gamepad: its sticks, triggers and buttons,
+;;; the same on both targets.
+;;;
+;;; A pad state holds whether a pad is connected, the six axes (lx ly rx ry
+;;; lt rt, each -1..1; the triggers rest at -1), the buttons held, and the
+;;; buttons pressed and released since pad-end-frame!. Buttons are named in
+;;; the standard layout:
+;;;
+;;;   a b x y lb rb back start guide lthumb rthumb up right down left
+;;;
+;;; (a is the bottom face button whatever the pad calls it).
+;;;
+;;; On the desktop pad-poll! reads the first connected gamepad through
+;;; GLFW's gamepad API (src/c/pad.c), once a frame after wait-frame. On the
+;;; web the page (assets/substratic/substratic.js) polls the browser's
+;;; Gamepad API and sends ("pad", "0") when none is connected, or
+;;; ("pad", "1,LX,LY,RX,RY,LT,RT,BITS"), BITS the buttons in the order above
+;;; as a number; pad-dispatch! takes it. For analogue input, read an axis
+;;; through (substratic input sticks)'s stick-analog for a dead zone.
+
+(define-library (substratic input pad)
+  (import (sigil core)
+          (sigil struct)
+          (sigil list)
+          (sigil string)
+          (sigil math))
+
+  (export %pad-read BUTTONS AXES
+          make-pad pad? pad-connected? pad-axis pad-held pad-held? pad-pressed? pad-released?
+          pad-set! pad-end-frame! pad-poll! parse-pad-payload pad-dispatch!)
+
+  (begin
+    (define BUTTONS '(a b x y lb rb back start guide lthumb rthumb up right down left))
+    (define AXES '(lx ly rx ry lt rt))
+    (define RESTING (list 0.0 0.0 0.0 0.0 -1.0 -1.0))
+
+    (define-struct pad
+      (connected default: #f mutable: #t)
+      (axes default: '(0.0 0.0 0.0 0.0 -1.0 -1.0) mutable: #t)   ; in AXES order
+      (held default: '() mutable: #t)
+      (pressed default: '() mutable: #t)
+      (released default: '() mutable: #t))
+
+    (define (make-pad) (pad))
+
+    (define (pad-connected? p) (pad-connected p))
+
+    ;; An axis by name ('lx ...), 0.0 (or -1.0 for a trigger) with no pad.
+    (define (pad-axis p name)
+      (let loop ((names AXES) (vals (pad-axes p)))
+        (cond ((null? names) 0.0)
+              ((eq? (car names) name) (car vals))
+              (else (loop (cdr names) (cdr vals))))))
+
+    (define (pad-held? p b) (and (memq b (pad-held p)) #t))
+    (define (pad-pressed? p b) (and (memq b (pad-pressed p)) #t))
+    (define (pad-released? p b) (and (memq b (pad-released p)) #t))
+
+    (define (bits->buttons bits)
+      (let loop ((bs BUTTONS) (k 0) (acc '()))
+        (if (null? bs)
+            (reverse acc)
+            (loop (cdr bs) (+ k 1)
+                  (if (= 1 (bitwise-and (arithmetic-shift bits (- k)) 1)) (cons (car bs) acc) acc)))))
+
+    ;; The new state: connected?, six axes, and the held buttons as bits.
+    ;; Presses and releases are the difference from the buttons held before;
+    ;; a pad that disconnects releases everything.
+    (define (pad-set! p connected axes bits)
+      (let ((now (if connected (bits->buttons bits) '()))
+            (before (pad-held p)))
+        (set-pad-pressed! p (append (filter (lambda (b) (not (memq b before))) now) (pad-pressed p)))
+        (set-pad-released! p (append (filter (lambda (b) (not (memq b now))) before) (pad-released p)))
+        (set-pad-held! p now)
+        (set-pad-connected! p (and connected #t))
+        (set-pad-axes! p (if connected axes RESTING))))
+
+    (define (pad-end-frame! p)
+      (set-pad-pressed! p '())
+      (set-pad-released! p '()))
+
+    ;; The native's 8 bytes -> (axes . bits).
+    (define (decode-read bv)
+      (let loop ((i 0) (acc '()))
+        (if (< i 6)
+            (loop (+ i 1) (cons (- (/ (bytevector-u8-ref bv i) 127.5) 1.0) acc))
+            (cons (reverse acc)
+                  (+ (bytevector-u8-ref bv 6) (* 256 (bytevector-u8-ref bv 7)))))))
+
+    ;; Desktop: read the first connected gamepad. On the web, a no-op (the
+    ;; page's events come through pad-dispatch!).
+    (define (pad-poll! p)
+      (let ((bv (guard (e (#t #f)) (%pad-read))))
+        (if bv
+            (let ((d (decode-read bv))) (pad-set! p #t (car d) (cdr d)))
+            (when (pad-connected p) (pad-set! p #f RESTING 0)))))
+
+    (define (first-six l) (let loop ((l l) (k 0)) (if (or (null? l) (= k 6)) (quote ()) (cons (car l) (loop (cdr l) (+ k 1))))))
+
+    ;; "0" -> (#f), "1,LX,LY,RX,RY,LT,RT,BITS" -> (#t axes bits); #f for
+    ;; anything else. Axes are clamped to -1..1.
+    (define (parse-pad-payload s)
+      (let ((parts (string-split s ",")))
+        (cond ((equal? parts '("0")) (list #f))
+              ((and (= (length parts) 8) (string=? (car parts) "1"))
+               (let ((nums (map string->number (cdr parts))))
+                 (and (not (memq #f nums))
+                      (exact-integer? (list-ref nums 6))
+                      (>= (list-ref nums 6) 0)
+                      (list #t
+                            (map (lambda (v) (max -1.0 (min 1.0 (* 1.0 v)))) (first-six nums))
+                            (list-ref nums 6)))))
+              (else #f))))
+
+    ;; ("pad", PAYLOAD) into the state. #t when the event was a pad event.
+    (define (pad-dispatch! p type payload)
+      (and (string=? type "pad")
+           (let ((d (parse-pad-payload payload)))
+             (when d
+               (if (car d)
+                   (pad-set! p #t (cadr d) (caddr d))
+                   (pad-set! p #f RESTING 0)))
+             #t)))))

@@ -27,6 +27,7 @@ Every module is `(substratic <area> <concept>)`.
 | `(substratic input keys)` | Keys down, pressed and released; DOM key names mapped to the desktop's |
 | `(substratic input sticks)` | Touch sticks by name; an 8-way reader tuned for platformers, an analogue reader with a dead zone |
 | `(substratic input events)` | The web page's key and stick events into the two states |
+| `(substratic input pad)` | A gamepad's sticks, triggers and buttons: GLFW's gamepad API natively, the browser's on the web |
 | `(substratic update version)` | version.json parsed; versions compared |
 | `(substratic update check)` | Whether to show "a new version is ready" or "new in X.Y.Z", once per version |
 | `(substratic playtest session)` | F1: a location readout. F2: a report with a screenshot, report.json and a typed note |

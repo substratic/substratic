@@ -29,6 +29,9 @@
 //              playtest-report -> ("playtest", "saved DIR" | "failed WHY" |
 //              "cancel"). With playtest on, two small buttons (i, report)
 //              stand in for F1 and F2 on a phone.
+//   gamepad    the browser's Gamepad API, read each animation frame and sent
+//              as ("pad", "1,LX,LY,RX,RY,LT,RT,BITS") or ("pad", "0") on change
+//              ((substratic input pad) reads it).
 //   fullscreen a small corner button where the Fullscreen API exists.
 //
 // Configure with window.SUBSTRATIC before this script loads; the defaults
@@ -43,7 +46,8 @@
     playtest: "param",               // true, false, or "param" (on with ?playtest)
     reportUrl: "playtest-report",
     versionUrl: "version.json",      // null: no update check
-    fullscreen: true
+    fullscreen: true,
+    gamepad: true                    // the browser's Gamepad API, as ("pad", ...)
   }, window.SUBSTRATIC || {});
 
   var params = new URLSearchParams(location.search);
@@ -193,6 +197,35 @@
            function () { send("keydown", bt.key); }, function () { send("keyup", bt.key); }, true);
   });
 
+  // ---- gamepad -------------------------------------------------------------------
+  // The browser's Gamepad API, read once per animation frame, sent as
+  // ("pad", "0") or ("pad", "1,LX,LY,RX,RY,LT,RT,BITS") only when it changes.
+  // BITS is (substratic input pad)'s button order, GLFW's:
+  //   a b x y lb rb back start guide lthumb rthumb up right down left
+  // mapped from the browser's standard layout (its button index per bit).
+  var STD_FOR_BIT = [0, 1, 2, 3, 4, 5, 8, 9, 16, 10, 11, 12, 15, 13, 14];
+  var lastPad = null;
+  function q(v) { return (Math.round(v * 100) / 100).toString(); }
+  function padPayload() {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (var i = 0; i < pads.length; i++) {
+      var p = pads[i];
+      if (!p || !p.connected) continue;
+      var btn = function (k) { var b = p.buttons[k]; return b ? b : { pressed: false, value: 0 }; };
+      var bits = 0;
+      for (var bit = 0; bit < STD_FOR_BIT.length; bit++) if (btn(STD_FOR_BIT[bit]).pressed) bits |= 1 << bit;
+      var ax = function (k) { return p.axes[k] || 0; };
+      return ["1", q(ax(0)), q(ax(1)), q(ax(2)), q(ax(3)),
+              q(btn(6).value * 2 - 1), q(btn(7).value * 2 - 1), String(bits)].join(",");
+    }
+    return "0";
+  }
+  function pollPad() {
+    var s = padPayload();
+    if (s !== lastPad) { lastPad = s; send("pad", s); }
+    requestAnimationFrame(pollPad);
+  }
+
   // ---- fullscreen -------------------------------------------------------------------
   if (cfg.fullscreen && document.documentElement.requestFullscreen) {
     var fs = document.createElement("button");
@@ -319,6 +352,7 @@
     }
     pending.forEach(function (p) { app.dispatch(p[0], p[1]); });
     pending = [];
+    if (cfg.gamepad && navigator.getGamepads) requestAnimationFrame(pollPad);
     if (cfg.versionUrl) {
       fetch(cfg.versionUrl, { cache: "no-store" })
         .then(function (r) { return r.ok ? r.text() : null; })

@@ -49,12 +49,13 @@
     (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
 
   ;; (substratic image capture): glReadPixels through sigil-desktop's GL proc
-  ;; loader natively; a stub answering #f on the web.
+  ;; loader natively; (substratic input pad): GLFW's gamepad state. Stubs
+  ;; answering #f on the web.
   libraries: (list
     (library
       name: 'substratic
-      c-sources: '("src/c/capture.c")
-      native-init: "sigil__init_substratic_image_capture_module"))
+      c-sources: '("src/c/capture.c" "src/c/pad.c" "src/c/natives.c")
+      native-init: "sigil__init_substratic_natives"))
 
   dev-dependencies: (list
     (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
@@ -68,7 +69,7 @@
       description: "Build substratic: its C library and its modules"
       steps: (list
         (compile-c-sources
-          sources: '("src/c/capture.c")
+          sources: '("src/c/capture.c" "src/c/pad.c" "src/c/natives.c")
           flags: (with-sigil-c-flags '("-std=c99" "-Wno-unused-parameter")))
         (create-static-library name: "substratic")
         ;; assets/substratic/substratic.js, copied into a dependent's web build

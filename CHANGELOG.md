@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased: 0.2.0
+
+- `(substratic input pad)`: a gamepad, natively through GLFW's gamepad API
+  (a small C native), on the web through the browser's Gamepad API, which
+  `substratic.js` now polls and sends as `("pad", ...)`.
+
 ## 0.1.0 (2026-09-25)
 
 The first modules, extracted from Crash The Stack and Harkfell, and the

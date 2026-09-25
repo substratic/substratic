@@ -1,0 +1,59 @@
+;;; (substratic input pad): the page's payload, the button edges, and a
+;;; disconnect. The native read is exercised by the demo's drive; with no
+;;; pad attached it must answer "not connected", never raise.
+
+(import (sigil test)
+        (substratic input pad))
+
+(test-group "pad: the page's payload"
+  (test "a connected pad"
+    (assert-equal (list #t (list 0.5 -0.25 0.0 0.0 -1.0 1.0) 5)
+                  (parse-pad-payload "1,0.5,-0.25,0,0,-1,1,5")))
+  (test "none connected"
+    (assert-equal (list #f) (parse-pad-payload "0")))
+  (test "axes are clamped"
+    (assert-equal 1.0 (car (cadr (parse-pad-payload "1,3,0,0,0,-1,-1,0")))))
+  (test "anything else is #f"
+    (assert-false (parse-pad-payload "1,0,0"))
+    (assert-false (parse-pad-payload "1,0,0,0,0,0,0,x"))
+    (assert-false (parse-pad-payload "1,0,0,0,0,0,0,1.5"))
+    (assert-false (parse-pad-payload "2"))))
+
+(test-group "pad: buttons"
+  (test "bits name the buttons in the standard order"
+    (let ((p (make-pad)))
+      ;; a (bit 0) and start (bit 7)
+      (pad-dispatch! p "pad" "1,0,0,0,0,-1,-1,129")
+      (assert-true (pad-held? p 'a))
+      (assert-true (pad-held? p 'start))
+      (assert-false (pad-held? p 'b))
+      (assert-true (pad-pressed? p 'a))))
+  (test "a press is seen once; a release is seen"
+    (let ((p (make-pad)))
+      (pad-dispatch! p "pad" "1,0,0,0,0,-1,-1,1")
+      (pad-end-frame! p)
+      (pad-dispatch! p "pad" "1,0,0,0,0,-1,-1,1")
+      (assert-false (pad-pressed? p 'a))
+      (pad-dispatch! p "pad" "1,0,0,0,0,-1,-1,0")
+      (assert-true (pad-released? p 'a))))
+  (test "the d-pad's bits"
+    (let ((p (make-pad)))
+      (pad-dispatch! p "pad" "1,0,0,0,0,-1,-1,30720")   ; bits 11..14
+      (assert-equal '(up right down left) (pad-held p))))
+  (test "a disconnect releases everything and rests the axes"
+    (let ((p (make-pad)))
+      (pad-dispatch! p "pad" "1,0.8,0,0,0,-1,-1,3")
+      (pad-end-frame! p)
+      (pad-dispatch! p "pad" "0")
+      (assert-false (pad-connected? p))
+      (assert-true (pad-released? p 'b))
+      (assert-equal 0.0 (pad-axis p 'lx))
+      (assert-equal -1.0 (pad-axis p 'lt))))
+  (test "other events are not the pad's"
+    (assert-false (pad-dispatch! (make-pad) "keydown" "a"))))
+
+(test-group "pad: the native read with no pad attached"
+  (test "not connected, no error"
+    (let ((p (make-pad)))
+      (pad-poll! p)
+      (assert-false (pad-connected? p)))))
