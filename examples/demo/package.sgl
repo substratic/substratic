@@ -15,6 +15,11 @@
 
 ;; The build's stamp: the commit, plus the second when the tree was dirty.
 (define (build-stamp)
+  (or (let ((s (getenv "SUBSTRATIC_DEMO_STAMP"))) (and s (> (string-length s) 0) s))
+      (build-stamp-from-git)))
+
+;; A build from a tarball (no .git) says so unless the stamp is given.
+(define (build-stamp-from-git)
   (let* ((sha (string-trim (process-output->string "git" "rev-parse" "--short=12" "HEAD")))
          (dirty (string-trim (process-output->string "git" "status" "--porcelain" "--untracked-files=no")))
          (sha (if (string=? sha "") "unversioned" sha)))

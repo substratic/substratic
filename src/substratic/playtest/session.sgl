@@ -60,6 +60,7 @@
 (define-library (substratic playtest session)
   (cond-expand
     (wasm (import (sigil struct)
+                  (sigil io)
                   (sigil math)
                   (sigil list)
                   (sigil string)
