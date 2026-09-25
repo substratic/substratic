@@ -1,0 +1,173 @@
+;;; (substratic update) - The version.json check: is there a newer version,
+;;; and what is new in this one.
+;;;
+;;; A game's site publishes /version.json beside the game, generated at
+;;; publish time from the tree being published, and served uncached:
+;;;
+;;;   {"version": "0.1.2", "date": "2026-09-25", "stamp": "a1b2c3d4e5f6",
+;;;    "summary": "One line about the release.", "news": "https://.../news/0-1-2/"}
+;;;
+;;; Only "version" is required; the rest may be missing. The game asks for
+;;; it and shows one of two quiet lines, never an interruption:
+;;;
+;;;   'waiting   a newer version is ready. On the web the service worker
+;;;              decides this (it has already fetched the new files), and
+;;;              the page says so ("update" "waiting"); version.json only
+;;;              says WHAT is waiting. On the desktop there is no worker, so
+;;;              the game compares: version.json's version newer than the
+;;;              running one.
+;;;   'new-in    the first launch of this version after another one ran:
+;;;              "New in X.Y.Z: summary", shown once per version. The store
+;;;              remembers the last version the player saw
+;;;              (updater-mark-seen!). The first launch ever shows nothing
+;;;              (there was no update) and only records the version.
+;;;   'none      neither.
+;;;
+;;; 'waiting wins over 'new-in. Everything is best-effort: no file, a parse
+;;; failure, a missing field, no network: the status is 'none and nothing
+;;; blocks.
+;;;
+;;; Transport. On the web the page (web/substratic.js) fetches version.json
+;;; at boot and hands the text over as ("update-info", TEXT);
+;;; updater-dispatch! takes it and the worker's ("update", "waiting").
+;;; Natively, (substratic update http) fetches it; any text from anywhere
+;;; can be given with updater-set-info!.
+;;;
+;;; Extracted from Crash The Stack's page fetch of /version.json, which
+;;; only showed what was waiting (it had a worker to compare for it); the
+;;; desktop comparison and the once-per-version line are new.
+
+(define-library (substratic update)
+  (import (sigil struct)
+          (sigil string)
+          (sigil list)
+          (sigil json)
+          (substratic store))
+
+  (export version-info version-info? version-info-version version-info-date
+          version-info-stamp version-info-summary version-info-news
+          parse-version-info version-compare
+          make-updater updater? updater-running updater-info updater-waiting?
+          updater-set-info! updater-set-waiting! updater-dispatch!
+          updater-status updater-line updater-mark-seen! updater-last-seen
+          SEEN-KEY)
+
+  (begin
+    (define SEEN-KEY "update-seen")
+
+    (define-struct version-info
+      (version default: "")
+      (date default: #f)
+      (stamp default: #f)
+      (summary default: #f)
+      (news default: #f))
+
+    (define (string-field d name)
+      (let ((v (guard (e (#t #f)) (json-get-in d (list name)))))
+        (and (string? v) (> (string-length v) 0) v)))
+
+    ;; version.json's text -> a version-info, or #f (not JSON, not an
+    ;; object, no string "version").
+    (define (parse-version-info text)
+      (and (string? text)
+           (let ((d (guard (e (#t #f)) (json-decode text))))
+             (and d
+                  (not (string? d))
+                  (let ((v (string-field d 'version)))
+                    (and v
+                         (version-info version: v
+                                       date: (string-field d 'date)
+                                       stamp: (string-field d 'stamp)
+                                       summary: (string-field d 'summary)
+                                       news: (string-field d 'news))))))))
+
+    ;; --- comparing versions --------------------------------------------------
+
+    ;; "0.1.10" -> (0 1 10); a part that is not a number stays a string
+    ;; ("1.0.0-rc1" -> (1 0 "0-rc1")).
+    (define (version-parts v)
+      (map (lambda (p) (or (string->number p) p)) (string-split v ".")))
+
+    (define (part-compare a b)
+      (cond ((and (number? a) (number? b)) (cond ((< a b) -1) ((> a b) 1) (else 0)))
+            ((number? a) 1)          ; a plain number is newer than a tagged one
+            ((number? b) -1)
+            ((string<? a b) -1)
+            ((string<? b a) 1)
+            (else 0)))
+
+    ;; -1, 0 or 1 as a is older than, the same as, or newer than b. Missing
+    ;; trailing parts count as 0 ("0.2" = "0.2.0").
+    (define (version-compare a b)
+      (let loop ((pa (version-parts a)) (pb (version-parts b)))
+        (cond ((and (null? pa) (null? pb)) 0)
+              (else
+               (let ((c (part-compare (if (null? pa) 0 (car pa)) (if (null? pb) 0 (car pb)))))
+                 (if (= c 0)
+                     (loop (if (null? pa) '() (cdr pa)) (if (null? pb) '() (cdr pb)))
+                     c))))))
+
+    ;; --- the updater -----------------------------------------------------------
+
+    ;; running: the version this build is. platform: 'web (a worker decides
+    ;; 'waiting) or 'desktop (the comparison does).
+    (define-struct updater
+      (running default: "0.0.0")
+      (platform default: 'desktop)
+      (info default: #f mutable: #t)
+      (waiting? default: #f mutable: #t))
+
+    (define (make-updater running platform)
+      (updater running: running platform: platform))
+
+    ;; Text from wherever version.json came from; #t when it parsed.
+    (define (updater-set-info! u text)
+      (let ((i (parse-version-info text)))
+        (set-updater-info! u i)
+        (and i #t)))
+
+    (define (updater-set-waiting! u on) (set-updater-waiting?! u (and on #t)))
+
+    ;; The page's events: ("update-info", TEXT) and ("update", "waiting").
+    ;; #t when the event was one of them.
+    (define (updater-dispatch! u type payload)
+      (cond ((string=? type "update-info") (updater-set-info! u payload) #t)
+            ((string=? type "update") (updater-set-waiting! u (string=? payload "waiting")) #t)
+            (else #f)))
+
+    (define (updater-last-seen) (let ((v (store-read-datum SEEN-KEY))) (and (string? v) v)))
+
+    ;; Record that the player has seen this version (after showing 'new-in,
+    ;; or at the first launch ever).
+    (define (updater-mark-seen! u) (store-write-datum! SEEN-KEY (updater-running u)))
+
+    ;; 'waiting, 'new-in or 'none, given the last version seen (a string, or
+    ;; #f for a first launch).
+    (define (updater-status u last-seen)
+      (let ((i (updater-info u)) (running (updater-running u)))
+        (cond ((if (eq? (updater-platform u) 'web)
+                   (updater-waiting? u)
+                   (and i (= (version-compare (version-info-version i) running) 1)))
+               'waiting)
+              ((and last-seen
+                    (not (string=? last-seen running))
+                    i
+                    (string=? (version-info-version i) running)
+                    (version-info-summary i))
+               'new-in)
+              (else 'none))))
+
+    ;; A plain English line for a status, or #f. Games with their own voice
+    ;; build their own from updater-info.
+    (define (updater-line u status)
+      (let ((i (updater-info u)))
+        (case status
+          ((waiting)
+           (if (eq? (updater-platform u) 'web)
+               (string-append "A new version is ready" (if i (string-append " (" (version-info-version i) ")") "")
+                              ". Reload to play it.")
+               (string-append "Version " (if i (version-info-version i) "?") " is out"
+                              (if (and i (version-info-news i)) (string-append ": " (version-info-news i)) "."))))
+          ((new-in)
+           (string-append "New in " (version-info-version i) ": " (version-info-summary i)))
+          (else #f))))))

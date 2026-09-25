@@ -1,0 +1,81 @@
+;;; (substratic png): the checksums against published values, the file's
+;;; structure, and a decoder (stb_image, through sigil-graphics) reading
+;;; back what was written. stb_image does not check CRCs, so the CRC is
+;;; held to its published test vector instead.
+
+(import (sigil test)
+        (sigil io)
+        (sigil fs)
+        (sigil time)
+        (sigil graphics image)
+        (substratic png))
+
+(define (ascii-bv s)
+  (let* ((n (string-length s)) (bv (make-bytevector n 0)))
+    (let loop ((i 0))
+      (when (< i n) (bytevector-u8-set! bv i (char->integer (string-ref s i))) (loop (+ i 1))))
+    bv))
+
+(define (u32-at bv i)
+  (+ (* (bytevector-u8-ref bv i) 16777216)
+     (* (bytevector-u8-ref bv (+ i 1)) 65536)
+     (* (bytevector-u8-ref bv (+ i 2)) 256)
+     (bytevector-u8-ref bv (+ i 3))))
+
+;; A w x h test card: every pixel's colour names its place.
+(define (card w h)
+  (let ((bv (make-bytevector (* w h 4) 0)))
+    (let loop ((i 0))
+      (when (< i (* w h))
+        (bytevector-u8-set! bv (* i 4) (modulo i 256))
+        (bytevector-u8-set! bv (+ (* i 4) 1) (modulo (* i 7) 256))
+        (bytevector-u8-set! bv (+ (* i 4) 2) (modulo (* i 13) 256))
+        (bytevector-u8-set! bv (+ (* i 4) 3) 255)
+        (loop (+ i 1))))
+    bv))
+
+(test-group "png: checksums"
+  (test "CRC-32 of 123456789 is CBF43926 (the published check value)"
+    (assert-equal #xCBF43926 (crc32 (ascii-bv "123456789"))))
+  (test "CRC-32 of nothing is 0"
+    (assert-equal 0 (crc32 (make-bytevector 0 0))))
+  (test "Adler-32 of Wikipedia is 11E60398"
+    (assert-equal #x11E60398 (adler32 (ascii-bv "Wikipedia")))))
+
+(test-group "png: the file"
+  (let* ((w 300) (h 250)
+         (png (rgba->png w h (card w h))))
+    (test "the signature, then IHDR with the size, 8-bit RGBA"
+      (assert-equal (bytevector 137 80 78 71 13 10 26 10) (bytevector-copy png 0 8))
+      (assert-equal 13 (u32-at png 8))
+      (assert-equal "IHDR" (utf8->string (bytevector-copy png 12 16)))
+      (assert-equal w (u32-at png 16))
+      (assert-equal h (u32-at png 20))
+      (assert-equal 8 (bytevector-u8-ref png 24))
+      (assert-equal 6 (bytevector-u8-ref png 25)))
+    (test "IHDR's CRC covers its type and data"
+      (assert-equal (crc32 (bytevector-copy png 12 29)) (u32-at png 29)))
+    (test "the file ends with IEND and its fixed CRC"
+      (let ((n (bytevector-length png)))
+        (assert-equal "IEND" (utf8->string (bytevector-copy png (- n 8) (- n 4))))
+        (assert-equal #xAE426082 (u32-at png (- n 4)))))
+    (test "more than one stored block (the scanlines are over 64 KB)"
+      (assert-true (> (* h (+ (* w 4) 1)) 65535)))
+    (test "stb_image reads it back at its size"
+      (let ((path (string-append "/tmp/substratic-test-png-" (number->string (current-jiffy)) ".png")))
+        (write-file-bytes path png)
+        (let ((img (load-image path)))
+          (assert-true (image? img))
+          (assert-equal w (image-width img))
+          (assert-equal h (image-height img))
+          (image-free! img))))
+    (test "a size that does not match the pixels is an error"
+      (assert-true (guard (e (#t #t)) (rgba->png 2 2 (make-bytevector 3 0)) #f)))))
+
+(test-group "png: flip-rows"
+  (test "rows bottom first come out top first"
+    (let ((bv (bytevector 1 1 1 1  2 2 2 2
+                          3 3 3 3  4 4 4 4)))
+      (assert-equal (bytevector 3 3 3 3  4 4 4 4
+                                1 1 1 1  2 2 2 2)
+                    (flip-rows 2 2 bv)))))

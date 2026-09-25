@@ -1,0 +1,133 @@
+;;; (substratic png) - RGBA pixels to a PNG file's bytes.
+;;;
+;;; For the playtest screenshot on the desktop: no image library is linked,
+;;; so the encoder is here, small and plain. The image is 8-bit RGBA, no
+;;; interlace, filter 0 (none) on every row, and the zlib stream uses
+;;; STORED deflate blocks (no compression): a 1600x704 frame is about
+;;; 4.5 MB. Any PNG reader takes it; size is not the point of a playtest
+;;; report.
+;;;
+;;; rgba->png takes the rows top first. flip-rows turns the bottom-first
+;;; rows glReadPixels gives into that order.
+
+(define-library (substratic png)
+  (import (sigil math))
+
+  (export rgba->png flip-rows crc32 adler32)
+
+  (begin
+    (define CRC-TABLE
+      (let ((t (make-vector 256 0)))
+        (let loop ((n 0))
+          (when (< n 256)
+            (let bits ((c n) (k 0))
+              (if (= k 8)
+                  (vector-set! t n c)
+                  (bits (if (= (bitwise-and c 1) 1)
+                            (bitwise-xor #xEDB88320 (arithmetic-shift c -1))
+                            (arithmetic-shift c -1))
+                        (+ k 1))))
+            (loop (+ n 1))))
+        t))
+
+    (define (crc-byte table c b)
+      (bitwise-xor (vector-ref table (bitwise-and (bitwise-xor c b) 255))
+                   (arithmetic-shift c -8)))
+
+    ;; CRC-32 (the PNG and zlib one) of bytes start..end of bv, continuing
+    ;; from crc (0 to begin).
+    (define (crc32-update crc bv start end)
+      (let ((table CRC-TABLE))
+        (let loop ((i start) (c (bitwise-xor crc #xFFFFFFFF)))
+          (if (< i end)
+              (loop (+ i 1) (crc-byte table c (bytevector-u8-ref bv i)))
+              (bitwise-xor c #xFFFFFFFF)))))
+
+    (define (crc32 bv)
+      (crc32-update 0 bv 0 (bytevector-length bv)))
+
+    ;; Adler-32 of all of bv.
+    (define (adler32 bv)
+      (let ((n (bytevector-length bv)))
+        (let loop ((i 0) (a 1) (b 0))
+          (if (< i n)
+              (let ((a (modulo (+ a (bytevector-u8-ref bv i)) 65521)))
+                (loop (+ i 1) a (modulo (+ b a) 65521)))
+              (+ (* b 65536) a)))))
+
+    (define (u32-be n)
+      (let ((bv (make-bytevector 4 0)))
+        (bytevector-u8-set! bv 0 (bitwise-and (arithmetic-shift n -24) 255))
+        (bytevector-u8-set! bv 1 (bitwise-and (arithmetic-shift n -16) 255))
+        (bytevector-u8-set! bv 2 (bitwise-and (arithmetic-shift n -8) 255))
+        (bytevector-u8-set! bv 3 (bitwise-and n 255))
+        bv))
+
+    (define (ascii s)
+      (let* ((n (string-length s)) (bv (make-bytevector n 0)))
+        (let loop ((i 0))
+          (when (< i n)
+            (bytevector-u8-set! bv i (char->integer (string-ref s i)))
+            (loop (+ i 1))))
+        bv))
+
+    ;; A chunk: length, type, data, CRC over type and data.
+    (define (chunk type data)
+      (let* ((td (bytevector-append (ascii type) data)))
+        (bytevector-append (u32-be (bytevector-length data)) td (u32-be (crc32 td)))))
+
+    ;; The raw scanlines: a filter byte (0) before each row of w*4 bytes.
+    (define (scanlines w h pixels)
+      (let* ((row (* w 4))
+             (out (make-bytevector (* h (+ row 1)) 0)))
+        (let loop ((y 0))
+          (when (< y h)
+            (bytevector-copy! out (+ (* y (+ row 1)) 1) pixels (* y row) (* (+ y 1) row))
+            (loop (+ y 1))))
+        out))
+
+    ;; A zlib stream of data in stored deflate blocks of at most 65535
+    ;; bytes each.
+    (define BLOCK 65535)
+
+    (define (zlib-stored data)
+      (let* ((n (bytevector-length data))
+             (blocks (max 1 (quotient (+ n (- BLOCK 1)) BLOCK)))
+             (out (make-bytevector (+ 2 (* 5 blocks) n 4) 0)))
+        (bytevector-u8-set! out 0 #x78)     ; deflate, 32K window
+        (bytevector-u8-set! out 1 #x01)     ; no dictionary, fastest; (0x78 0x01) % 31 = 0
+        (let loop ((b 0) (at 2))
+          (when (< b blocks)
+            (let* ((start (* b BLOCK))
+                   (len (min BLOCK (- n start)))
+                   (last (if (= b (- blocks 1)) 1 0)))
+              (bytevector-u8-set! out at last)
+              (bytevector-u8-set! out (+ at 1) (bitwise-and len 255))
+              (bytevector-u8-set! out (+ at 2) (arithmetic-shift len -8))
+              (bytevector-u8-set! out (+ at 3) (bitwise-and (bitwise-xor len #xFFFF) 255))
+              (bytevector-u8-set! out (+ at 4) (arithmetic-shift (bitwise-xor len #xFFFF) -8))
+              (bytevector-copy! out (+ at 5) data start (+ start len))
+              (loop (+ b 1) (+ at 5 len)))))
+        (bytevector-copy! out (+ 2 (* 5 blocks) n) (u32-be (adler32 data)) 0 4)
+        out))
+
+    ;; w x h RGBA8 pixels (w*h*4 bytes, rows top first) -> the PNG's bytes.
+    (define (rgba->png w h pixels)
+      (unless (= (bytevector-length pixels) (* w h 4))
+        (error "rgba->png: expected w*h*4 bytes" w h (bytevector-length pixels)))
+      (let ((ihdr (bytevector-append (u32-be w) (u32-be h)
+                                     (bytevector 8 6 0 0 0))))   ; 8-bit, RGBA, deflate, filter 0, no interlace
+        (bytevector-append (bytevector 137 80 78 71 13 10 26 10)
+                           (chunk "IHDR" ihdr)
+                           (chunk "IDAT" (zlib-stored (scanlines w h pixels)))
+                           (chunk "IEND" (make-bytevector 0 0)))))
+
+    ;; Rows bottom first (GL's order) -> rows top first, as a new bytevector.
+    (define (flip-rows w h pixels)
+      (let* ((row (* w 4))
+             (out (make-bytevector (* h row) 0)))
+        (let loop ((y 0))
+          (when (< y h)
+            (bytevector-copy! out (* y row) pixels (* (- h 1 y) row) (* (- h y) row))
+            (loop (+ y 1))))
+        out))))
