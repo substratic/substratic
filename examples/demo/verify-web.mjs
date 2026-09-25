@@ -178,8 +178,12 @@ else {
   const r = JSON.parse(fs.readFileSync(path.join(d, "report.json"), "utf8"));
   if (r.note === "web: the gem is stuck") pass("report note"); else fail("report note", JSON.stringify(r.note));
   if (r.platform === "web" && r.location && r.location.room) pass(`report location (${r.location.room})`); else fail("report location", JSON.stringify(r.location));
-  const x = r.location && r.location.position && r.location.position[0];
-  if (typeof x === "number" && x > 200) pass(`the stick moved the player (x ${x})`); else fail("stick", `position ${JSON.stringify(r.location && r.location.position)}`);
+  // x across rooms (each 320 wide; the player starts at 160 in x0y0): the
+  // stick may carry the player through a doorway. An arrow-key pulse alone
+  // (the loader's swipe, blocked now) would give about 10 px, well short of 200.
+  const m = r.location && r.location.room && /^x(\d+)y\d+$/.exec(r.location.room);
+  const x = m && r.location.position && Number(m[1]) * 320 + r.location.position[0];
+  if (typeof x === "number" && x > 200) pass(`the stick moved the player (x ${x.toFixed(1)} across rooms)`); else fail("stick", `room ${r.location && r.location.room} position ${JSON.stringify(r.location && r.location.position)}`);
   if (r.page && r.page.build && r.page.build !== "__VERSION__") pass(`report build ${r.page.build}`); else fail("report build", JSON.stringify(r.page));
   const png = fs.readFileSync(path.join(d, "screenshot.png"));
   const canvas = await evaluate("[document.querySelector('#stage').width, document.querySelector('#stage').height]");
