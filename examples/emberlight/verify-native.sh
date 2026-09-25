@@ -50,6 +50,11 @@ cleanup() {
 trap cleanup EXIT
 
 [ -x "$BIN" ] || setup_failed "no binary $BIN"
+# the tools, realised once before any is used: a first guix shell on a fresh
+# machine prints its download progress, which must not land in a measurement
+for pkg in xorg-server xdotool imagemagick jq; do  # each exactly as used below: one profile each
+  guix shell "$pkg" -- true >> "$WORK/guix-tools.log" 2>&1 || setup_failed "guix could not provide $pkg (see $WORK/guix-tools.log)"
+done
 [ -S "/tmp/.X11-unix/X${DISP#:}" ] && setup_failed "display $DISP is taken"
 
 guix shell xorg-server -- Xvfb "$DISP" -screen 0 1400x900x24 +extension GLX -nolisten tcp > "$WORK/xvfb.log" 2>&1 &
