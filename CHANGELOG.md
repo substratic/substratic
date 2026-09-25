@@ -2,6 +2,8 @@
 
 ## Unreleased: 0.2.0
 
+- `examples/emberlight`: a tiny game made with Substratic, its showcase and
+  integration test; the six-room demo stays as a test fixture.
 - `(substratic input pad)`: a gamepad, natively through GLFW's gamepad API
   (a small C native), on the web through the browser's Gamepad API, which
   `substratic.js` now polls and sends as `("pad", ...)`.
