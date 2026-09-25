@@ -1,0 +1,63 @@
+;;; (substratic data json): the reader on valid and invalid text, and the
+;;; writer's output read back by sigil-json's decoder, an independent
+;;; parser, so a writer bug cannot hide behind a reader with the same bug.
+
+(import (sigil test)
+        (sigil json)
+        (sigil string)
+        (substratic data json))
+
+(test-group "json: reading"
+  (test "an object is an alist in order; arrays are vectors"
+    (assert-equal (list (cons 'a 1) (cons 'b (vector 1 2.5 "x")) (cons 'c (list (cons 'd #t))))
+                  (json->datum "{\"a\": 1, \"b\": [1, 2.5, \"x\"], \"c\": {\"d\": true}}")))
+  (test "literals, and whitespace around the value"
+    (assert-equal 'null (json->datum " null "))
+    (assert-equal #f (json->datum "false"))
+    (assert-equal -12.5 (json->datum "-1.25e1"))
+    (assert-equal '() (json->datum "{}"))
+    (assert-equal (vector) (json->datum "[ ]")))
+  (test "string escapes, a \\u escape and a surrogate pair"
+    (assert-equal "a\"b\\c/d\ne" (json->datum "\"a\\\"b\\\\c\\/d\\ne\""))
+    (assert-equal "A" (json->datum "\"\\u0041\""))
+    (assert-equal 128512 (char->integer (string-ref (json->datum "\"\\ud83d\\ude00\"") 0))))
+  (test "json-ref follows keys and indexes, #f where the path leads nowhere"
+    (let ((d (json->datum "{\"a\": {\"b\": [10, 20]}}")))
+      (assert-equal 20 (json-ref d 'a 'b 1))
+      (assert-false (json-ref d 'a 'c))
+      (assert-false (json-ref d 'a 'b 2))
+      (assert-false (json-ref d 'a 'b 'x))))
+  (test "anything that is not one JSON value is #f, never an error"
+    (for-each (lambda (t) (assert-false (json->datum t)))
+              (list "" "{" "[1,]" "{\"a\" 1}" "{\"a\":1,}" "tru" "1 2" "\"open" "'x'" "{a:1}" "<html>")))
+  (test "a non-string is #f"
+    (assert-false (json->datum 42))))
+
+(test-group "json: writing, read back by sigil-json"
+  (test "an alist is an object, lists and vectors arrays, a pair two elements"
+    (let ((d (json-decode (datum->json (list (cons 'a 1) (cons 'b (cons 2 3)) (cons 'c (list "x" 'y)) (cons 'v (vector 1)))))))
+      (assert-equal 1 (json-get-in d '(a)))
+      (assert-equal 3 (json-get-in d '(b 1)))
+      (assert-equal "y" (json-get-in d '(c 1)))
+      (assert-equal 1 (json-get-in d '(v 0)))))
+  (test "floats, negative floats and non-finite numbers"
+    (let ((d (json-decode (datum->json (list 0.5 -0.25 1790340000.5 (* 1e300 1e300) 7)))))
+      (assert-equal 0.5 (json-get-in d '(0)))
+      (assert-equal -0.25 (json-get-in d '(1)))
+      (assert-equal 1790340000.5 (json-get-in d '(2)))
+      (assert-true (json-null? (json-get-in d '(3))))
+      (assert-equal 7 (json-get-in d '(4)))))
+  (test "strings with quotes, backslashes, newlines, control characters and <"
+    (let ((s (string-append "a\"b\\c\nd" (string (integer->char 1)) "</script>")))
+      (assert-equal s (json-decode (datum->json s)))
+      (assert-false (string-contains? (datum->json s) "</script>"))))
+  (test "true, false, null, the empty list, a symbol, a char"
+    (assert-equal "[true,false,null,[],\"sym\",\"c\"]"
+                  (datum->json (list #t #f 'null '() 'sym #\c))))
+  (test "a record or procedure is its written form, as a string"
+    (assert-true (string? (json-decode (datum->json car))))))
+
+(test-group "json: round trip through our own reader"
+  (test "what the writer writes, the reader reads"
+    (let ((d (list (cons 'game "demo") (cons 'cell (vector 4 7)) (cons 'ok #t) (cons 'n 'null))))
+      (assert-equal d (json->datum (datum->json d))))))

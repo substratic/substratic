@@ -1,0 +1,126 @@
+;;; (demo game world) - Six rooms, some gems, a player: enough of a game
+;;; to exercise the engine. Pure and deterministic: the same inputs from
+;;; the same state give the same state, tick by tick.
+;;;
+;;; The view is 320x176, a room is 20x11 cells of 16 px. Rooms sit on a
+;;; 3x2 grid: the top row is the meadow, the bottom row the cave. Each room
+;;; is walled, with a doorway in the middle of every side that has a
+;;; neighbour, and one block inside.
+
+(define-library (demo game world)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
+          (sigil string))
+
+  (export VIEW-W VIEW-H CELL COLS ROWS ROOMS-X ROOMS-Y
+          world world? world-new world-room world-x world-y world-facing
+          world-items world-gems world-tick
+          world-step wall? room-key region-name gems-in
+          describe snapshot)
+
+  (begin
+    (define VIEW-W 320)
+    (define VIEW-H 176)
+    (define CELL 16)
+    (define COLS 20)
+    (define ROWS 11)
+    (define ROOMS-X 3)
+    (define ROOMS-Y 2)
+    (define SIZE 10)          ; the player's square, px
+    (define SPEED 1.5)        ; px per tick at a full push
+    (define TURN 0.08)        ; radians per tick at a full turn
+
+    (define-struct world
+      (room default: (cons 0 0))
+      (x default: 160.0)
+      (y default: 88.0)
+      (facing default: 0.0)
+      (items default: '())      ; gem names collected, newest first
+      (gems default: '())       ; ((rx ry col row name) ...) still lying about
+      (tick default: 0))
+
+    (define GEMS
+      (list (list 0 0 4 3 "amber") (list 1 0 15 7 "jade") (list 2 0 10 2 "opal")
+            (list 0 1 5 8 "garnet") (list 1 1 12 3 "onyx") (list 2 1 16 8 "pearl")))
+
+    (define (world-new) (world gems: GEMS))
+
+    (define (room-key r) (string-append "x" (number->string (car r)) "y" (number->string (cdr r))))
+    (define (region-name r) (if (= (cdr r) 0) "meadow" "cave"))
+
+    (define (neighbour? rx ry) (and (>= rx 0) (< rx ROOMS-X) (>= ry 0) (< ry ROOMS-Y)))
+
+    ;; Is cell (col, row) of room r a wall? Outside the room is open (a
+    ;; doorway leads there).
+    (define (wall? r col row)
+      (let ((rx (car r)) (ry (cdr r)))
+        (cond ((or (< col 0) (>= col COLS) (< row 0) (>= row ROWS)) #f)
+              ((or (= col 0) (= col (- COLS 1)))
+               (not (and (>= row 4) (<= row 6)
+                         (neighbour? (if (= col 0) (- rx 1) (+ rx 1)) ry))))
+              ((or (= row 0) (= row (- ROWS 1)))
+               (not (and (>= col 9) (<= col 10)
+                         (neighbour? rx (if (= row 0) (- ry 1) (+ ry 1))))))
+              (else
+               (let ((bc (+ 5 (modulo (+ (* rx 7) (* ry 3)) 8))))
+                 (and (= row 5) (>= col bc) (<= col (+ bc 1))))))))
+
+    (define (cell-of v) (exact (floor (/ v CELL))))
+
+    ;; Does a SIZE square centred at (x, y) touch a wall of room r?
+    (define (blocked? r x y)
+      (let* ((h (/ SIZE 2.0))
+             (c0 (cell-of (- x h))) (c1 (cell-of (- (+ x h) 0.001)))
+             (r0 (cell-of (- y h))) (r1 (cell-of (- (+ y h) 0.001))))
+        (let loop ((c c0))
+          (and (<= c c1)
+               (or (let rows ((rw r0))
+                     (and (<= rw r1) (or (wall? r c rw) (rows (+ rw 1)))))
+                   (loop (+ c 1)))))))
+
+    (define (gems-in w)
+      (let ((r (world-room w)))
+        (filter (lambda (g) (and (= (car g) (car r)) (= (cadr g) (cdr r)))) (world-gems w))))
+
+    ;; One tick. input: (list dx dy turn), each -1..1.
+    (define (world-step w input)
+      (let* ((r (world-room w))
+             (dx (* SPEED (car input)))
+             (dy (* SPEED (cadr input)))
+             (x1 (if (blocked? r (+ (world-x w) dx) (world-y w)) (world-x w) (+ (world-x w) dx)))
+             (y1 (if (blocked? r x1 (+ (world-y w) dy)) (world-y w) (+ (world-y w) dy)))
+             (facing (+ (world-facing w) (* TURN (caddr input)))))
+        (pick-up (cross (world w x: x1 y: y1 facing: facing tick: (+ (world-tick w) 1))))))
+
+    ;; Through a doorway into the next room.
+    (define (cross w)
+      (let ((r (world-room w)) (x (world-x w)) (y (world-y w)))
+        (cond ((< x 0.0) (world w room: (cons (- (car r) 1) (cdr r)) x: (+ x VIEW-W)))
+              ((>= x VIEW-W) (world w room: (cons (+ (car r) 1) (cdr r)) x: (- x VIEW-W)))
+              ((< y 0.0) (world w room: (cons (car r) (- (cdr r) 1)) y: (+ y VIEW-H)))
+              ((>= y VIEW-H) (world w room: (cons (car r) (+ (cdr r) 1)) y: (- y VIEW-H)))
+              (else w))))
+
+    (define (pick-up w)
+      (let* ((col (cell-of (world-x w))) (row (cell-of (world-y w)))
+             (here (filter (lambda (g) (and (= (list-ref g 2) col) (= (list-ref g 3) row))) (gems-in w))))
+        (if (null? here)
+            w
+            (world w items: (cons (list-ref (car here) 4) (world-items w))
+                     gems: (filter (lambda (g) (not (memq g here))) (world-gems w))))))
+
+    ;; For (substratic playtest session).
+    (define (describe w)
+      (list (cons 'region (region-name (world-room w)))
+            (cons 'room (room-key (world-room w)))
+            (cons 'cell (cons (cell-of (world-x w)) (cell-of (world-y w))))
+            (cons 'position (cons (world-x w) (world-y w)))
+            (cons 'items (reverse (world-items w)))))
+
+    (define (snapshot w)
+      (list (cons 'room (list (car (world-room w)) (cdr (world-room w))))
+            (cons 'x (world-x w)) (cons 'y (world-y w)) (cons 'facing (world-facing w))
+            (cons 'items (reverse (world-items w)))
+            (cons 'gems-left (map (lambda (g) (list-ref g 4)) (world-gems w)))
+            (cons 'tick (world-tick w))))))

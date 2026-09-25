@@ -10,7 +10,7 @@
         (sigil json)
         (substratic store kv)
         (substratic image png)
-        (substratic playtest json)
+        (substratic data json)
         (substratic playtest session))
 
 (define (describe)

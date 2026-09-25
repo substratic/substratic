@@ -43,9 +43,9 @@
     (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
     ;; Drawing, both targets.
     (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
-    ;; version.json and report.json.
-    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0")
-    ;; Web only: localStorage for (substratic store).
+    ;; Web only: localStorage for (substratic store kv). A game on the web
+    ;; lists it too (a dependency's own dependencies are not compiled into
+    ;; the game's bundle unless the game lists them, sigil 0.22.7).
     (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
 
   ;; (substratic image capture): glReadPixels through sigil-desktop's GL proc
@@ -58,7 +58,9 @@
 
   dev-dependencies: (list
     (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
-    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7"))
+    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7")
+    ;; the tests check (substratic data json)'s output with an independent decoder
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0"))
 
   tasks: (list
     (task
@@ -69,5 +71,7 @@
           sources: '("src/c/capture.c")
           flags: (with-sigil-c-flags '("-std=c99" "-Wno-unused-parameter")))
         (create-static-library name: "substratic")
+        ;; assets/substratic/substratic.js, copied into a dependent's web build
+        (link-assets)
         (compile-sigil-modules sources: "src/**/*.sgl"
                                output-dir: (config-output-subdir "lib"))))))

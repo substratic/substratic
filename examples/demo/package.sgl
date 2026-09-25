@@ -1,0 +1,94 @@
+;;; substratic-demo - six rooms and a few gems, to exercise substratic:
+;;; the view at whole scales (and the desktop window's snapping), keys and
+;;; touch sticks, the version.json line, and the playtest reports (F1, F2).
+;;;
+;;;   ../../scripts/dev sigil build                     desktop (bytecode)
+;;;   ../../scripts/dev sigil build --config release    desktop, native
+;;;   ../../scripts/dev sigil build --config web        browser (needs wasm-opt)
+;;;   node ../../tools/serve.mjs build/web 8000         serve it, with reports
+;;;
+;;; index.template.html is a link to substratic's generic page template.
+
+(import (sigil process) (sigil string) (sigil time) (sigil math) (sigil fs))
+
+(define sigil-repo "codeberg:sigil/sigil")
+
+;; The build's stamp: the commit, plus the second when the tree was dirty.
+(define (build-stamp)
+  (let* ((sha (string-trim (process-output->string "git" "rev-parse" "--short=12" "HEAD")))
+         (dirty (string-trim (process-output->string "git" "status" "--porcelain" "--untracked-files=no")))
+         (sha (if (string=? sha "") "unversioned" sha)))
+    (if (string=? dirty "")
+        sha
+        (string-append sha "-dirty-" (number->string (exact (floor (current-second))))))))
+
+;; After link-web-application: the page stamped, and a version.json for the
+;; update line (the demo's own version, with a summary to show as "new in").
+(define (stamp-web ctx)
+  (let* ((out (config-output-dir (context-config ctx)))
+         (page-path (path-join out "index.html"))
+         (page (read-file-string page-path)))
+    (write-file-string page-path
+                       (string-replace (string-replace page "__VERSION__" (build-stamp))
+                                       "__TITLE__" "Substratic demo"))
+    (write-file-string (path-join out "version.json")
+                       (string-append "{\"version\":\"0.1.0\",\"stamp\":\"" (build-stamp)
+                                      "\",\"summary\":\"The first demo: six rooms, six gems, and F2.\"}\n"))
+    (display "  web stamp ") (display (build-stamp)) (newline)
+    ctx))
+
+(package
+  name: "substratic-demo"
+  version: "0.1.0"
+  sigil: "0.22.7"
+  description: "A small demo of the substratic engine"
+  license: "BSD-3-Clause"
+  authors: (list "David Wilson <david@daviwil.com>")
+
+  entry: '(demo main)
+  bundle-name: "substratic-demo"
+
+  configs: (list
+    (config
+      name: 'dev
+      output-dir: "build/dev"
+      debug?: #t
+      optimize: 0
+      bundle?: #t)
+    (config
+      name: 'release
+      output-dir: "build/release"
+      debug?: #f
+      optimize: 2
+      backend: 'native
+      bundle?: #t)
+    (config
+      name: 'web
+      output-dir: "build/web"
+      toolchain: 'zig
+      target: "wasm32-wasi"
+      backend: 'native
+      debug?: #f
+      optimize: 2
+      bundle?: #t
+      features: '(web wasm graphics)))
+
+  dependencies: (list
+    (from-path dir: "../.." package: "substratic")
+    (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
+    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
+    (from-git url: sigil-repo package: "sigil-wasm-runtime" version: ">=0.22.7" configs: '(web))
+    (from-git url: sigil-repo package: "sigil-wasm-gles3" version: ">=0.22.7" configs: '(web))
+    (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Compile the demo (and, on the web config, link the browser app)"
+      steps: (list
+        (compile-sigil-modules sources: "src/**/*.sgl")
+        (link-assets)
+        (lambda (ctx)
+          (if (memq (target-os ctx) '(wasm wasi))
+              (stamp-web ((link-web-application name: "substratic-demo" html-mount-id: "status") ctx))
+              ctx))))))

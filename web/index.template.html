@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  The page template for a Substratic game on the web. Copy it to the
+  game's package root as index.template.html (link-web-application reads it
+  from there), set the title, and adjust window.SUBSTRATIC below.
+
+  It forwards EVERY URL parameter to the game (("params", QUERY), then
+  ("param", "KEY=VALUE") for each), with no list to keep in step with the
+  game. The rest is assets/substratic/substratic.js: touch sticks, buttons,
+  focus, the version.json check, the playtest report's browser half and a
+  fullscreen button. The build copies it into build/web/assets/substratic/
+  because substratic is a dependency.
+
+  __TITLE__ and __VERSION__ are for the game's build step to stamp.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="substratic-version" content="__VERSION__">
+  <title>__TITLE__</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+                 overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+    #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+             display: block; touch-action: none; user-select: none;
+             -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+    #status { position: fixed; left: 8px; bottom: 8px; color: #aab; font: 13px ui-monospace, monospace; }
+    #status:empty, #status [data-sigil-booting] { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="stage" tabindex="0"></canvas>
+  <div id="status"></div>
+  <script>
+  // What this game's page has. Every key is optional; see substratic.js.
+  window.SUBSTRATIC = {
+    canvas: "#stage",
+    sticks: [{ name: "move", zone: "left" }, { name: "look", zone: "right" }],
+    buttons: [],
+    playtest: "param",          // ?playtest turns the report on
+    reportUrl: "playtest-report",
+    versionUrl: "version.json",
+    fullscreen: true
+  };
+  </script>
+  <script src="assets/substratic/substratic.js"></script>
+  <!--sigil:app-->
+</body>
+</html>

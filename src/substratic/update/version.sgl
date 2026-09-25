@@ -13,7 +13,7 @@
   (import (sigil struct)
           (sigil string)
           (sigil list)
-          (sigil json))
+          (substratic data json))
 
   (export version-info version-info? version-info-version version-info-date
           version-info-stamp version-info-summary version-info-news
@@ -28,16 +28,15 @@
       (news default: #f))
 
     (define (string-field d name)
-      (let ((v (guard (e (#t #f)) (json-get-in d (list name)))))
+      (let ((v (guard (e (#t #f)) (json-ref d name))))
         (and (string? v) (> (string-length v) 0) v)))
 
     ;; version.json's text -> a version-info, or #f (not JSON, not an
     ;; object, no string "version").
     (define (parse-version-info text)
       (and (string? text)
-           (let ((d (guard (e (#t #f)) (json-decode text))))
-             (and d
-                  (not (string? d))
+           (let ((d (guard (e (#t #f)) (json->datum text))))
+             (and (pair? d)
                   (let ((v (string-field d 'version)))
                     (and v
                          (version-info version: v

@@ -1,0 +1,47 @@
+;;; (demo game draw) - The room, in view pixels, into the current target.
+
+(define-library (demo game draw)
+  (import (sigil math)
+          (sigil graphics)
+          (substratic text font)
+          (demo game world))
+
+  (export draw-world!)
+
+  (begin
+    (define (region-colours r)
+      (if (= (cdr r) 0)
+          (list (list 0.10 0.16 0.12) (list 0.30 0.42 0.28))    ; meadow: floor, wall
+          (list (list 0.07 0.07 0.12) (list 0.28 0.26 0.40))))  ; cave
+
+    (define (colour! c) (set-color (car c) (cadr c) (caddr c) 1.0))
+
+    ;; line: the update line, or #f.
+    (define (draw-world! w line)
+      (let* ((r (world-room w)) (cs (region-colours r)))
+        (colour! (car cs))
+        (draw-filled-rect 0 0 VIEW-W VIEW-H)
+        (colour! (cadr cs))
+        (let rows ((row 0))
+          (when (< row ROWS)
+            (let cols ((col 0))
+              (when (< col COLS)
+                (when (wall? r col row) (draw-filled-rect (* col CELL) (* row CELL) CELL CELL))
+                (cols (+ col 1))))
+            (rows (+ row 1))))
+        (for-each (lambda (g)
+                    (set-color 0.95 0.75 0.25 1.0)
+                    (draw-filled-rect (+ (* (list-ref g 2) CELL) 5) (+ (* (list-ref g 3) CELL) 5) 6 6))
+                  (gems-in w))
+        (let ((x (world-x w)) (y (world-y w)) (a (world-facing w)))
+          (set-color 0.9 0.95 1.0 1.0)
+          (draw-filled-rect (- x 5.0) (- y 5.0) 10 10)
+          (set-color 1.0 0.4 0.3 1.0)
+          (draw-line x y (+ x (* 10.0 (cos a))) (+ y (* 10.0 (sin a)))))
+        (set-color 0.85 0.9 0.85 1.0)
+        (draw-text (string-append (region-name r) " " (room-key r)) 4 4 1)
+        (when line
+          (set-color 0.0 0.0 0.0 0.6)
+          (draw-filled-rect 0 (- VIEW-H 12) VIEW-W 12)
+          (set-color 1.0 0.9 0.6 1.0)
+          (draw-text line 3 (- VIEW-H 10) 1))))))

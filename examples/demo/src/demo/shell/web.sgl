@@ -1,0 +1,75 @@
+;;; (demo shell web) - The browser: one frame per requestAnimationFrame
+;;; dispatch, the page's events in between.
+;;;
+;;; Every URL parameter arrives as ("param", "KEY=VALUE") from the page
+;;; template (web/index.template.html in substratic). The demo reads:
+;;;   ?selftest          run the engine's checks on this target and print them
+;;;   ?update=waiting    act as if a service worker had an update waiting
+;;;   ?seen=VERSION      pretend the last version seen was VERSION
+;;;   ?build=STAMP       the build stamp for the readout
+;;; and prints every parameter it is given ("substratic-demo: param ..."),
+;;; so a check can see the page forwarded it.
+
+(define-library (demo shell web)
+  (import (sigil core)
+          (sigil string)
+          (sigil graphics)
+          (sigil browser gles3)
+          (substratic input events)
+          (substratic update check)
+          (substratic playtest session)
+          (demo shell core)
+          (demo selftest checks))
+
+  (export web-main web-dispatch)
+
+  (begin
+    (define *last-ms* #f)
+    (define *selftest* #f)
+    (define *said-ready* #f)
+
+    (define (frame-dt payload)
+      (let* ((ms (or (string->number payload) 0.0))
+             (dt (if *last-ms* (/ (- ms *last-ms*) 1000.0) (/ 1.0 60.0))))
+        (set! *last-ms* ms)
+        (if (or (< dt 0.0) (> dt 0.25)) (/ 1.0 60.0) dt)))
+
+    (define (say . parts) (display (apply string-append "substratic-demo: " parts)) (newline))
+
+    (define (param! kv)
+      (say "param " kv)
+      (let* ((i (string-index kv #\=))
+             (k (if i (substring kv 0 i) kv))
+             (v (if i (substring kv (+ i 1) (string-length kv)) "")))
+        (cond ((string=? k "selftest") (set! *selftest* #t))
+              ((and (string=? k "update") (string=? v "waiting")) (updater-set-waiting! (core-updater) #t))
+              ((string=? k "seen") (core-set-seen! v)))))
+
+    (define (tick! payload)
+      (gles3-resize-to-display)
+      (when *selftest*
+        (set! *selftest* #f)
+        (run-selftest 'web))
+      (core-frame! (frame-dt payload) (gles3-canvas-width) (gles3-canvas-height) #f)
+      (unless *said-ready*
+        (set! *said-ready* #t)
+        (say "ready")))
+
+    (define (web-main)
+      (unless (gles3-use-canvas "#stage")
+        (error "substratic-demo: no WebGL2 context for #stage"))
+      (core-boot! "web" 'web)
+      (gles3-resize-to-display)
+      (gfx-setup)
+      (gles3-start-loop "substratic-demo-tick")
+      0)
+
+    ;; The page's events. The playtest first (F1 and F2, and every key while
+    ;; a report is open), then the updater, then the keys and sticks.
+    (define (web-dispatch type payload)
+      (cond ((string=? type "frame") (tick! payload) 0)
+            ((string=? type "param") (param! payload) 0)
+            ((playtest-dispatch! (core-playtest) type payload) 1)
+            ((updater-dispatch! (core-updater) type payload) 1)
+            ((input-dispatch! (core-keys) (core-sticks) type payload) 1)
+            (else 0)))))

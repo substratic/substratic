@@ -1,0 +1,144 @@
+;;; (demo shell core) - What both shells share: the world on the fixed
+;;; clock, the input it reads, the view at its fit, the update line, and
+;;; the playtest.
+;;;
+;;; Each frame: the clock turns dt into ticks; each tick reads the keys and
+;;; sticks into one input, records it for the playtest, and steps the
+;;; world; then the world is drawn into the 320x176 view target, the view
+;;; is put on the window at its fit, and the playtest draws over it. While
+;;; a report is being made the world holds still.
+
+(define-library (demo shell core)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil graphics)
+          (substratic time clock)
+          (substratic view fit)
+          (substratic view present)
+          (substratic input keys)
+          (substratic input sticks)
+          (substratic store kv)
+          (substratic update version)
+          (substratic update check)
+          (substratic playtest session)
+          (demo game world)
+          (demo game draw))
+
+  (export core-boot! core-frame! core-keys core-sticks core-playtest core-updater
+          core-world core-set-seen! core-update-line
+          GAME-NAME VERSION)
+
+  (begin
+    (define GAME-NAME "substratic-demo")
+    (define VERSION "0.1.0")
+
+    (define *world* (world-new))
+    (define *clock* (clock-new))
+    (define *keys* (make-keys))
+    (define *sticks* (make-sticks))
+    (define *pt* #f)
+    (define *updater* #f)
+    (define *rt* #f)
+    (define *presenter* #f)
+    (define *last-room* #f)
+    (define *last-seen* 'unread)   ; the version the player last saw, read once
+    (define *line* #f)             ; the update line in force
+    (define *line-info* (quote never)) ; the version-info it was computed from
+    (define *line-waiting* #f)         ; ... and the worker's word
+
+    (define (core-keys) *keys*)
+    (define (core-sticks) *sticks*)
+    (define (core-playtest) *pt*)
+    (define (core-updater) *updater*)
+    (define (core-world) *world*)
+
+    ;; build: the build stamp; platform: 'desktop or 'web.
+    (define (core-boot! build platform)
+      (set-store-app! GAME-NAME)
+      (set! *pt* (make-playtest game: GAME-NAME build: build platform: platform
+                                describe: (lambda () (describe *world*))
+                                snapshot: (lambda () (snapshot *world*))
+                                enabled: #t))
+      (set! *updater* (make-updater VERSION platform))
+      (playtest-room-entered! *pt* 0))
+
+    ;; For trying the "new in" line: pretend the player last saw v.
+    (define (core-set-seen! v) (store-write-datum! SEEN-KEY v))
+
+    ;; --- input ------------------------------------------------------------------
+
+    (define (axis neg pos)
+      (cond ((and (keys-held? *keys* neg) (not (keys-held? *keys* pos))) -1.0)
+            ((and (keys-held? *keys* pos) (not (keys-held? *keys* neg))) 1.0)
+            (else 0.0)))
+
+    (define (round-2 v) (/ (round (* v 100.0)) 100.0))
+
+    ;; One tick's input, (list dx dy turn), rounded so the log is exact.
+    (define (current-input)
+      (let* ((mv (stick-analog (car (stick-vector *sticks* "move")) (cdr (stick-vector *sticks* "move")) 0.15))
+             (lk (stick-vector *sticks* "look"))
+             (kx (+ (axis 'left 'right) (axis 'a 'd)))
+             (ky (+ (axis 'up 'down) (axis 'w 's)))
+             (dx (max -1.0 (min 1.0 (+ kx (car mv)))))
+             (dy (max -1.0 (min 1.0 (+ ky (cdr mv)))))
+             (turn (max -1.0 (min 1.0 (+ (axis 'q 'e) (car (stick-analog (car lk) (cdr lk) 0.2)))))))
+        (list (round-2 dx) (round-2 dy) (round-2 turn))))
+
+    ;; --- the update line ------------------------------------------------------------
+
+    (define (core-update-line)
+      (let ((info (updater-info *updater*)))
+        (when (eq? *last-seen* 'unread)
+          (set! *last-seen* (updater-last-seen)))
+        (unless (and (eq? info *line-info*) (eq? (updater-waiting? *updater*) *line-waiting*))
+          (set! *line-info* info)
+          (set! *line-waiting* (updater-waiting? *updater*))
+          (let ((status (updater-status *updater* *last-seen*)))
+            (set! *line* (updater-line *updater* status))
+            ;; once per version: the line stays up this session, and is
+            ;; never shown again; a first launch just records the version
+            (when (or (eq? status 'new-in) (and (not *last-seen*) info))
+              (updater-mark-seen! *updater*))))
+        *line*))
+
+    ;; --- a frame ----------------------------------------------------------------------
+
+    (define (step-world! n)
+      (let loop ((i 0))
+        (when (< i n)
+          (let ((in (current-input)))
+            (playtest-record-input! *pt* (world-tick *world*) in)
+            (set! *world* (world-step *world* in))
+            (unless (equal? (world-room *world*) *last-room*)
+              (set! *last-room* (world-room *world*))
+              (playtest-room-entered! *pt* (world-tick *world*))))
+          (loop (+ i 1)))))
+
+    ;; dt seconds since the last frame; the window's size in pixels.
+    ;; integer-only: the desktop window's rule.
+    (define (core-frame! dt win-w win-h integer-only)
+      (set! *clock* (clock-advance *clock* dt))
+      (if (playtest-busy? *pt*)
+          (keys-clear! *keys*)
+          (step-world! (clock-steps *clock*)))
+      (playtest-tick! *pt* (world-tick *world*))
+      (unless *rt*
+        (set! *rt* (make-render-target VIEW-W VIEW-H 'nearest))
+        (set! *presenter* (make-presenter VIEW-W VIEW-H)))
+      (let ((f (view-fit win-w win-h VIEW-W VIEW-H integer-only: integer-only))
+            (line (core-update-line)))
+        (begin-frame)
+        (set-blend-mode 'normal)
+        (set-color 0.0 0.0 0.0 1.0)
+        (draw-filled-rect 0 0 win-w win-h)
+        (with-render-target *rt*
+          (set-blend-mode 'normal)
+          (draw-world! *world* line))
+        (view-present! *presenter* *rt* f)
+        (playtest-draw! *pt* win-w win-h)
+        (end-frame))
+      (playtest-after-frame! *pt* win-w win-h)
+      (keys-end-frame! *keys*))))

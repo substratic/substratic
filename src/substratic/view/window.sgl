@@ -1,0 +1,156 @@
+;;; (substratic view window) - A desktop window at whole-number scales of
+;;; the view, remembered between runs.
+;;;
+;;; The window opens at a remembered whole scale of the view (x2 the first
+;;; time: small, like a handheld's screen, and 1x is too small on a HiDPI
+;;; display). A window resized by hand snaps to the whole scale it fits,
+;;; never below the minimum, and that scale is remembered. F11 or Alt+Enter
+;;; toggles fullscreen, which is remembered too. The view itself is fitted
+;;; every frame by (substratic view fit) with integer-only: #t, so whatever
+;;; size the window ends up, the view is drawn at the largest whole scale
+;;; that fits, centred, black around it.
+;;;
+;;; SCREEN UNITS. Scales here are screen units per view pixel: the units
+;;; window-open and window-set-size! take and window-width reports. The
+;;; framebuffer is the device pixel ratio times that (2x on a HiDPI output,
+;;; 1.25x or 1.5x under fractional scaling), so x2 is the same size on the
+;;; screen at any ratio, and the view drawn into the framebuffer lands at
+;;; a larger whole scale there (x4 at a ratio of 2).
+;;;
+;;; THE GUARDS. A snap the compositor refuses is worse than none: GLFW
+;;; takes the asked size as the window's at once, the compositor sends no
+;;; new size back, and the game draws a small picture in the corner of a
+;;; big window until the next size change. So a snap happens only when:
+;;;   - the window, once it first settled, was the size asked for.
+;;;     Otherwise the window manager chose the size (a tiling manager, whose
+;;;     size can arrive a few frames after the first), and a snap would
+;;;     fight it.
+;;;   - the framebuffer does not fill the monitor's width or height: the
+;;;     compositor has it fullscreen or maximized itself. Nothing is
+;;;     remembered from such a size either.
+;;;   - never twice from the same size, so a refusing manager or one that
+;;;     sends its own size back is not fought.
+;;; A resize settles for SETTLE frames before it snaps, so a drag is not
+;;; fought either.
+;;;
+;;; The game keeps the remembered value where it likes (a settings row):
+;;; the window reports it through a callback as a symbol, 'x2 .. 'x8 or
+;;; 'fullscreen, and takes it back at open with window-open-scale.
+;;;
+;;; Extracted from Harkfell's native shell, where D37 was built and driven
+;;; on Xvfb, sway and a HiDPI screen. On the web every call is a no-op: a
+;;; page fits its canvas.
+
+(define-library (substratic view window)
+  (cond-expand
+    (wasm (import (sigil struct)))
+    (else (import (sigil struct)
+                  (sigil math)
+                  (sigil list)
+                  (sigil desktop))))
+
+  (export make-window-scaler window-scaler? window-open-scale window-scaler-frame!
+          scale-symbol symbol-scale)
+
+  (begin
+    (define-struct window-scaler
+      (vw default: 400)
+      (vh default: 240)
+      (min-scale default: 2)
+      (max-scale default: 8)
+      (settle default: 20)
+      (remember default: #f)                   ; (lambda (symbol) ...)
+      (opened-k default: 2 mutable: #t)        ; the whole scale the window opened at
+      (stored-k default: #f mutable: #t)       ; the whole scale last remembered
+      (placed-ok default: #f mutable: #t)      ; once settled, the window was the size asked for
+      (placed-known default: #f mutable: #t)   ; ... and it has settled once
+      (last-size default: #f mutable: #t)      ; (w . h) in screen units
+      (stable default: 0 mutable: #t)          ; frames the window has held that size
+      (snapped-from default: '() mutable: #t)  ; sizes a snap was asked from
+      (fullscreen-asked default: #f mutable: #t))
+
+    ;; vw, vh: the view's size in view pixels. remember: called with the
+    ;; symbol to keep whenever the scale or fullscreen changes.
+    (define (make-window-scaler vw vh (keys: (min-scale 2) (max-scale 8) (settle 20)
+                                             (remember (lambda (v) #f))))
+      (window-scaler vw: vw vh: vh min-scale: min-scale max-scale: max-scale
+                     settle: settle remember: remember))
+
+    (define (scale-symbol k) (string->symbol (string-append "x" (number->string k))))
+
+    ;; 'x3 -> 3; 'fullscreen and anything else -> #f.
+    (define (symbol-scale v)
+      (and (symbol? v)
+           (let ((s (symbol->string v)))
+             (and (> (string-length s) 1)
+                  (char=? (string-ref s 0) #\x)
+                  (string->number (substring s 1 (string-length s)))))))
+
+    ;; The whole scale to open at, from the remembered symbol (#f the first
+    ;; time). A remembered 'fullscreen opens at the minimum and goes
+    ;; fullscreen on the first frame.
+    (define (window-open-scale ws stored)
+      (let* ((k (symbol-scale stored))
+             (k (if (and k (integer? k) (>= k (window-scaler-min-scale ws)) (<= k (window-scaler-max-scale ws)))
+                    k
+                    (window-scaler-min-scale ws))))
+        (set-window-scaler-fullscreen-asked! ws (eq? stored 'fullscreen))
+        (set-window-scaler-opened-k! ws k)
+        (set-window-scaler-stored-k! ws k)
+        k))
+
+    (cond-expand
+      (wasm
+       (define (window-scaler-frame! ws) #f))
+      (else
+       (define (remember! ws v) ((window-scaler-remember ws) v))
+
+       (define (fit-k ws w h)
+         (max 1 (exact (floor (min (/ w (* 1.0 (window-scaler-vw ws)))
+                                   (/ h (* 1.0 (window-scaler-vh ws))))))))
+
+       ;; The window's size in screen units; the framebuffer's when the
+       ;; window reports nothing.
+       (define (window-size)
+         (let ((w (window-width)) (h (window-height)))
+           (if (and w h (> w 0) (> h 0))
+               (cons w h)
+               (cons (frame-width) (frame-height)))))
+
+       (define (fills-monitor?)
+         (let ((m (monitor-size)))
+           (and (pair? m)
+                (or (>= (frame-width) (car m)) (>= (frame-height) (cadr m))))))
+
+       ;; Once a frame, after wait-frame.
+       (define (window-scaler-frame! ws)
+         (when (or (key-pressed? 'f11)
+                   (and (key-pressed? 'return) (or (key-down? 'alt) (key-down? 'right-alt))))
+           (let ((on (not (fullscreen?))))
+             (set-fullscreen! on)
+             (remember! ws (if on 'fullscreen (scale-symbol (or (window-scaler-stored-k ws) (window-scaler-opened-k ws)))))))
+         (let* ((size (window-size)) (w (car size)) (h (cdr size))
+                (vw (window-scaler-vw ws)) (vh (window-scaler-vh ws))
+                (last (window-scaler-last-size ws)))
+           (if (and last (= w (car last)) (= h (cdr last)))
+               (set-window-scaler-stable! ws (+ (window-scaler-stable ws) 1))
+               (begin (set-window-scaler-last-size! ws (cons w h)) (set-window-scaler-stable! ws 0)))
+           (when (and (not (window-scaler-placed-known ws)) (= (window-scaler-stable ws) (window-scaler-settle ws)))
+             (set-window-scaler-placed-known! ws #t)
+             (set-window-scaler-placed-ok! ws (and (= w (* (window-scaler-opened-k ws) vw))
+                                                   (= h (* (window-scaler-opened-k ws) vh)))))
+           (when (window-scaler-fullscreen-asked ws)
+             (set-window-scaler-fullscreen-asked! ws #f)
+             (set-fullscreen! #t))
+           (when (and (window-scaler-placed-ok ws)
+                      (= (window-scaler-stable ws) (window-scaler-settle ws))
+                      (not (fullscreen?))
+                      (not (fills-monitor?)))
+             (let ((k (max (window-scaler-min-scale ws) (fit-k ws w h))))
+               (when (and (<= k (window-scaler-max-scale ws)) (not (eqv? k (window-scaler-stored-k ws))))
+                 (remember! ws (scale-symbol k))
+                 (set-window-scaler-stored-k! ws k))
+               (unless (or (and (= w (* k vw)) (= h (* k vh)))
+                           (member (cons w h) (window-scaler-snapped-from ws)))
+                 (set-window-scaler-snapped-from! ws (cons (cons w h) (window-scaler-snapped-from ws)))
+                 (window-set-size! (* k vw) (* k vh)))))))))))

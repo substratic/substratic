@@ -1,0 +1,154 @@
+;;; (demo selftest checks) - The engine's checks, run inside a built game
+;;; on its own target.
+;;;
+;;; The package's test suite runs on the bytecode VM and the native
+;;; backend; this runs the same kinds of checks in a release binary and in
+;;; the browser's wasm, where the numbers are 32-bit-sized and the store is
+;;; localStorage. One line per check, then a verdict line:
+;;;
+;;;   selftest: PASS NAME
+;;;   selftest: FAIL NAME (WHAT)
+;;;   selftest: DONE platform=web pass=N fail=M
+;;;
+;;; A check that raises is a FAIL with the error's message. The list's
+;;; length is printed too, so a run that stopped early cannot pass for a
+;;; complete one.
+
+(define-library (demo selftest checks)
+  (import (sigil core)
+          (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil io)
+
+          (sigil time)
+          (substratic time clock)
+          (substratic time tween)
+          (substratic view fit)
+          (substratic input keys)
+          (substratic input sticks)
+          (substratic input events)
+          (substratic store kv)
+          (substratic store settings)
+          (substratic update version)
+          (substratic update check)
+          (substratic image png)
+          (substratic data json)
+          (substratic playtest session)
+          (demo game world))
+
+  (export run-selftest SELFTEST-COUNT)
+
+  (begin
+    (define (ascii-bv s)
+      (let* ((n (string-length s)) (bv (make-bytevector n 0)))
+        (let loop ((i 0))
+          (when (< i n) (bytevector-u8-set! bv i (char->integer (string-ref s i))) (loop (+ i 1))))
+        bv))
+
+    (define (drive-tween dt frames)
+      (let loop ((f 0) (c (clock-new)) (t (tween-new 0.0 100.0 30 'out-quad)) (at15 #f))
+        (if (= f frames)
+            (list t c at15)
+            (let* ((c (clock-advance c dt)) (t (tween-after-frame t c)))
+              (loop (+ f 1) c t (or at15 (and (= (clock-ticks c) 15) (tween-value t 0.0))))))))
+
+    (define ROWS
+      (list (setting id: 'music name: "MUSIC" values: (list 'on 'off) default: 'on key: "selftest-music")))
+    (define TABLE (make-settings-table ROWS version: 1 version-key: "selftest-settings-version"))
+
+    ;; (name . thunk): a thunk answers #t, or a string saying what was wrong.
+    (define CHECKS
+      (list
+        (cons "clock-cap"
+              (lambda () (let ((c (clock-advance (clock-new) 0.25)))
+                           (or (= (clock-steps c) MAX-STEPS-PER-FRAME) "the cap did not hold"))))
+        (cons "tween-two-rates"
+              (lambda () (let ((a (drive-tween 0.016 63)) (b (drive-tween 0.033 31)))
+                           (or (and (tween-done? (car a)) (tween-done? (car b))
+                                    (caddr a) (caddr b) (< (abs (- (caddr a) (caddr b))) 1e-6))
+                               "the drives disagree"))))
+        (cons "view-fit"
+              (lambda () (let ((f (view-fit 1000 621 400 176)) (g (view-fit 700 300 400 176 integer-only: #t)))
+                           (or (and (= (fit-scale f) 2) (= (fit-x f) 100) (eq? (fit-mode g) 'integer) (= (fit-scale g) 1))
+                               "wrong placement"))))
+        (cons "keys-and-sticks"
+              (lambda () (let ((ks (make-keys)) (st (make-sticks)))
+                           (input-dispatch! ks st "keydown" "ArrowLeft")
+                           (input-dispatch! ks st "stick" "move,0.6,0.8")
+                           (or (and (keys-pressed? ks 'left) (eq? (dom-key->symbol "F2") 'f2)
+                                    (eq? (stick-sector 0.6 0.0 'none) 'e)
+                                    (< (abs (- (cdr (stick-vector st "move")) 0.8)) 1e-9))
+                               "input lost"))))
+        (cons "store-round-trip"
+              (lambda () (store-write-datum! "selftest" '(a "b" 3))
+                         (let ((back (store-read-datum "selftest")))
+                           (store-remove! "selftest")
+                           (or (and (equal? back '(a "b" 3)) (not (store-get "selftest"))) "store lost the datum"))))
+        (cons "settings"
+              (lambda () (let* ((s (settings-load TABLE)) (s2 (settings-step TABLE s 'music 1)))
+                           (settings-save! TABLE s2 'music)
+                           (let ((back (settings-value TABLE (settings-load TABLE) 'music)))
+                             (settings-save! TABLE s 'music)
+                             (or (eq? back 'off) "the setting did not stick")))))
+        (cons "version-compare"
+              (lambda () (or (and (= (version-compare "0.1.10" "0.1.9") 1)
+                                  (version-info? (parse-version-info "{\"version\":\"0.2.0\",\"summary\":\"s\"}"))
+                                  (not (parse-version-info "nope")))
+                             "versions wrong")))
+        (cons "updater-desktop"
+              (lambda () (let ((u (make-updater "0.1.0" 'desktop)))
+                           (updater-set-info! u "{\"version\":\"0.2.0\"}")
+                           (or (eq? (updater-status u "0.1.0") 'waiting) "no update seen"))))
+        (cons "crc32-check-value"
+              (lambda () (let ((c (crc32 (ascii-bv "123456789"))))
+                           (or (= c #xCBF43926) (string-append "got " (number->string c))))))
+        (cons "adler32"
+              (lambda () (or (= (adler32 (ascii-bv "Wikipedia")) #x11E60398) "wrong adler")))
+        (cons "png-structure"
+              (lambda () (let ((png (rgba->png 3 2 (make-bytevector 24 200))))
+                           (or (and (= (bytevector-u8-ref png 0) 137) (= (bytevector-u8-ref png 1) 80)
+                                    (= (bytevector-u8-ref png (- (bytevector-length png) 1)) #x82))
+                               "not a PNG"))))
+        (cons "datum->json"
+              (lambda () (let ((j (datum->json (list (cons 'a 1) (cons 'b (cons 2 3)) (cons 'c (list "x" 'y))))))
+                           (or (string=? j "{\"a\":1,\"b\":[2,3],\"c\":[\"x\",\"y\"]}") j))))
+        (cons "playtest-report"
+              (lambda () (let ((p (make-playtest game: "t" build: "b" enabled: #t
+                                                 describe: (lambda () (describe (world-new)))
+                                                 snapshot: (lambda () (snapshot (world-new))))))
+                           (let ((d (json->datum (playtest-report-json p "note" #f))))
+                             (or (and (string=? (json-ref d 'location 'room) "x0y0")
+                                      (string=? (json-ref d 'note) "note"))
+                                 "report wrong")))))
+        (cons "world-deterministic"
+              (lambda () (let loop ((i 0) (a (world-new)) (b (world-new)))
+                           (if (= i 300)
+                               (or (and (= (world-x a) (world-x b)) (= (world-y a) (world-y b))
+                                        (not (= (world-x a) 160.0)))
+                                   "the two runs differ, or nothing moved")
+                               (let ((in (list 1.0 (if (< i 150) -0.5 0.5) 0.3)))
+                                 (loop (+ i 1) (world-step a in) (world-step b in)))))))))
+
+    (define SELFTEST-COUNT (length CHECKS))
+
+    (define (say . parts) (display (apply string-append "selftest: " parts)) (newline))
+
+    ;; Runs every check and prints the lines. #t when all passed.
+    (define (run-selftest platform)
+      ;; the desktop store is files: keep them out of the player's data directory
+      (when (eq? platform (quote desktop))
+        (set-store-root! (string-append "/tmp/substratic-demo-selftest-" (number->string (current-jiffy)))))
+      (let loop ((cs CHECKS) (pass 0) (fail 0))
+        (if (null? cs)
+            (begin
+              (say "DONE platform=" (symbol->string platform)
+                   " pass=" (number->string pass) " fail=" (number->string fail)
+                   " of=" (number->string SELFTEST-COUNT))
+              (= fail 0))
+            (let ((r (guard (e (#t (if (error-object? e) (error-object-message e) "raised")))
+                       ((cdar cs)))))
+              (if (eq? r #t)
+                  (begin (say "PASS " (caar cs)) (loop (cdr cs) (+ pass 1) fail))
+                  (begin (say "FAIL " (caar cs) " (" (if (string? r) r "no answer") ")")
+                         (loop (cdr cs) pass (+ fail 1))))))))))

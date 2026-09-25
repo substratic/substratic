@@ -1,0 +1,211 @@
+;;; (substratic data json) - JSON in and out, small: for version.json and
+;;; report.json.
+;;;
+;;; READING (json->datum): an object is an alist of (symbol . value) in the
+;;; order written, an array a vector, a string a string, a number a
+;;; number, true #t, false #f, null the symbol null. Text that is not one
+;;; JSON value (with only whitespace around it) is #f; nothing raises.
+;;; json-ref walks a path of symbols (object keys) and integers (array
+;;; indexes), answering #f where the path leads nowhere.
+;;;
+;;; WRITING (datum->json): an alist (every element a pair with a symbol or
+;;; string key) is an object, another list or a vector an array, a dotted
+;;; pair a two-element array, a symbol or char a string, the symbol null
+;;; null, a non-finite number null; anything else (a record, a procedure)
+;;; its written form, as a string. A report's datums come from the game, so
+;;; the mapping has to cover every shape it may hand over.
+;;;
+;;; Here rather than a dependency on sigil-json because a dependency's own
+;;; dependencies are not compiled into a game's bundle unless the game
+;;; lists them too (sigil 0.22.7); an engine that needs every game to list
+;;; its JSON library is worse than one that needs 150 lines.
+
+(define-library (substratic data json)
+  (import (sigil math)
+          (sigil string)
+          (sigil io))
+
+  (export json->datum json-ref datum->json json-string)
+
+  (begin
+    ;; --- writing -----------------------------------------------------------------
+
+    (define (hex4 n)
+      (let ((s (number->string n 16)))
+        (string-append (make-string (- 4 (string-length s)) #\0) s)))
+
+    ;; A string as a JSON string literal. "<" is escaped too, so the text is
+    ;; safe inside an HTML <script> element.
+    (define (json-string s)
+      (let ((out (open-output-string)))
+        (write-char #\" out)
+        (string-for-each
+          (lambda (c)
+            (let ((i (char->integer c)))
+              (cond ((char=? c #\") (write-string "\\\"" out))
+                    ((char=? c #\\) (write-string "\\\\" out))
+                    ((char=? c #\newline) (write-string "\\n" out))
+                    ((char=? c #\return) (write-string "\\r" out))
+                    ((char=? c #\tab) (write-string "\\t" out))
+                    ((char=? c #\<) (write-string "\\u003c" out))
+                    ((< i 32) (write-string (string-append "\\u" (hex4 i)) out))
+                    (else (write-char c out)))))
+          s)
+        (write-char #\" out)
+        (get-output-string out)))
+
+    (define (written d) (with-output-to-string (lambda () (write d))))
+
+    (define (json-key k)
+      (json-string (cond ((symbol? k) (symbol->string k)) ((string? k) k) (else (written k)))))
+
+    (define (object-like? d)
+      (and (pair? d) (list? d)
+           (let loop ((l d))
+             (or (null? l)
+                 (and (pair? (car l))
+                      (or (symbol? (caar l)) (string? (caar l)))
+                      (loop (cdr l)))))))
+
+    (define (finite-number? x) (and (= x x) (< (abs x) 1e300)))
+
+    ;; A float as JSON: Sigil writes 1.5, 1e+300 and 1.79034e+09, all valid
+    ;; JSON; a leading "." or a trailing "." gets its zero.
+    (define (float->json x)
+      (let* ((s (number->string x))
+             (s (if (char=? (string-ref s 0) #\.) (string-append "0" s) s))
+             (s (if (string-starts-with? s "-.") (string-append "-0" (substring s 1 (string-length s))) s))
+             (n (string-length s)))
+        (if (char=? (string-ref s (- n 1)) #\.) (string-append s "0") s)))
+
+    (define (datum->json d)
+      (cond ((string? d) (json-string d))
+            ((eq? d #t) "true")
+            ((eq? d #f) "false")
+            ((eq? d 'null) "null")
+            ((number? d)
+             (cond ((exact-integer? d) (number->string d))
+                   ((finite-number? (inexact d)) (float->json (inexact d)))
+                   (else "null")))
+            ((symbol? d) (json-string (symbol->string d)))
+            ((char? d) (json-string (string d)))
+            ((null? d) "[]")
+            ((vector? d) (datum->json (vector->list d)))
+            ((object-like? d)
+             (string-append "{"
+                            (string-join (map (lambda (e) (string-append (json-key (car e)) ":" (datum->json (cdr e)))) d) ",")
+                            "}"))
+            ((list? d) (string-append "[" (string-join (map datum->json d) ",") "]"))
+            ((pair? d) (string-append "[" (datum->json (car d)) "," (datum->json (cdr d)) "]"))
+            (else (json-string (written d)))))
+
+    ;; --- reading -----------------------------------------------------------------
+
+    ;; The reader works on a string and an index, and escapes by raising json-not-json
+    ;; on the first thing that is not JSON.
+    (define (json->datum text)
+      (and (string? text)
+           (guard (e ((eq? e (quote json-not-json)) #f))
+             (begin
+               (let* ((n (string-length text))
+                      (fail (lambda () (raise (quote json-not-json)))))
+                 (define (peek i) (if (< i n) (string-ref text i) #f))
+                 (define (skip i)
+                   (if (and (< i n) (memv (string-ref text i) '(#\space #\tab #\newline #\return)))
+                       (skip (+ i 1))
+                       i))
+                 (define (expect-word i word value)
+                   (let ((m (string-length word)))
+                     (if (and (<= (+ i m) n) (string=? (substring text i (+ i m)) word))
+                         (cons value (+ i m))
+                         (fail))))
+                 (define (hex-at i)
+                   (if (<= (+ i 4) n)
+                       (or (string->number (substring text i (+ i 4)) 16) (fail))
+                       (fail)))
+                 (define (read-string i)       ; i: just after the opening quote
+                   (let ((out (open-output-string)))
+                     (let loop ((i i))
+                       (let ((c (peek i)))
+                         (cond ((not c) (fail))
+                               ((char=? c #\") (cons (get-output-string out) (+ i 1)))
+                               ((char=? c #\\)
+                                (let ((e (peek (+ i 1))))
+                                  (case e
+                                    ((#\") (write-char #\" out) (loop (+ i 2)))
+                                    ((#\\) (write-char #\\ out) (loop (+ i 2)))
+                                    ((#\/) (write-char #\/ out) (loop (+ i 2)))
+                                    ((#\b) (write-char (integer->char 8) out) (loop (+ i 2)))
+                                    ((#\f) (write-char (integer->char 12) out) (loop (+ i 2)))
+                                    ((#\n) (write-char #\newline out) (loop (+ i 2)))
+                                    ((#\r) (write-char #\return out) (loop (+ i 2)))
+                                    ((#\t) (write-char #\tab out) (loop (+ i 2)))
+                                    ((#\u)
+                                     (let ((u (hex-at (+ i 2))))
+                                       (if (and (>= u #xD800) (<= u #xDBFF)
+                                                (eqv? (peek (+ i 6)) #\\) (eqv? (peek (+ i 7)) #\u))
+                                           (let ((lo (hex-at (+ i 8))))
+                                             (write-char (integer->char (+ #x10000 (* (- u #xD800) 1024) (- lo #xDC00))) out)
+                                             (loop (+ i 12)))
+                                           (begin
+                                             (write-char (integer->char (if (and (>= u #xD800) (<= u #xDFFF)) #xFFFD u)) out)
+                                             (loop (+ i 6))))))
+                                    (else (fail)))))
+                               ((< (char->integer c) 32) (fail))
+                               (else (write-char c out) (loop (+ i 1))))))))
+                 (define (read-number i)
+                   (let loop ((j i))
+                     (let ((c (peek j)))
+                       (if (and c (or (char-numeric? c) (memv c '(#\- #\+ #\. #\e #\E))))
+                           (loop (+ j 1))
+                           (let ((v (and (> j i) (string->number (substring text i j)))))
+                             (if v (cons v j) (fail)))))))
+                 (define (read-array i)        ; i: just after [
+                   (let ((i (skip i)))
+                     (if (eqv? (peek i) #\])
+                         (cons (vector) (+ i 1))
+                         (let loop ((i i) (acc '()))
+                           (let* ((r (read-value i)) (i (skip (cdr r))) (acc (cons (car r) acc)))
+                             (case (peek i)
+                               ((#\,) (loop (+ i 1) acc))
+                               ((#\]) (cons (list->vector (reverse acc)) (+ i 1)))
+                               (else (fail))))))))
+                 (define (read-object i)       ; i: just after {
+                   (let ((i (skip i)))
+                     (if (eqv? (peek i) #\})
+                         (cons '() (+ i 1))
+                         (let loop ((i i) (acc '()))
+                           (let ((i (skip i)))
+                             (unless (eqv? (peek i) #\") (fail))
+                             (let* ((kr (read-string (+ i 1)))
+                                    (i (skip (cdr kr))))
+                               (unless (eqv? (peek i) #\:) (fail))
+                               (let* ((vr (read-value (+ i 1)))
+                                      (i (skip (cdr vr)))
+                                      (acc (cons (cons (string->symbol (car kr)) (car vr)) acc)))
+                                 (case (peek i)
+                                   ((#\,) (loop (+ i 1) acc))
+                                   ((#\}) (cons (reverse acc) (+ i 1)))
+                                   (else (fail))))))))))
+                 (define (read-value i)
+                   (let* ((i (skip i)) (c (peek i)))
+                     (cond ((not c) (fail))
+                           ((char=? c #\{) (read-object (+ i 1)))
+                           ((char=? c #\[) (read-array (+ i 1)))
+                           ((char=? c #\") (read-string (+ i 1)))
+                           ((char=? c #\t) (expect-word i "true" #t))
+                           ((char=? c #\f) (expect-word i "false" #f))
+                           ((char=? c #\n) (expect-word i "null" 'null))
+                           (else (read-number i)))))
+                 (let ((r (read-value 0)))
+                   (if (= (skip (cdr r)) n) (car r) (fail))))))))
+
+    ;; Follow a path of object keys (symbols) and array indexes (integers).
+    (define (json-ref d . path)
+      (let loop ((d d) (p path))
+        (cond ((null? p) d)
+              ((and (symbol? (car p)) (list? d))
+               (let ((e (assq (car p) d))) (and e (loop (cdr e) (cdr p)))))
+              ((and (exact-integer? (car p)) (vector? d) (>= (car p) 0) (< (car p) (vector-length d)))
+               (loop (vector-ref d (car p)) (cdr p)))
+              (else #f))))))

@@ -1,0 +1,75 @@
+;;; (demo shell native) - The desktop: a sigil-desktop window at whole
+;;; scales of the view.
+;;;
+;;;   substratic-demo                      play (arrows or WASD move, Q and E turn,
+;;;                                        F1 the readout, F2 a report, F11 fullscreen,
+;;;                                        Escape quits)
+;;;   substratic-demo --version-json FILE  read version.json from FILE (the desktop
+;;;                                        compares it with this version)
+;;;   substratic-demo --seen VERSION       pretend the last version seen was VERSION
+;;;   substratic-demo --selftest           no window: the engine's checks on this
+;;;                                        target; exits 1 on a failure
+;;;   substratic-demo --build STAMP        the build stamp for the readout
+
+(define-library (demo shell native)
+  (import (sigil io)
+          (sigil fs)
+          (sigil list)
+          (sigil process)
+          (sigil desktop)
+          (sigil graphics)
+          (substratic view window)
+          (substratic input keys)
+          (substratic store kv)
+          (substratic update check)
+          (substratic playtest session)
+          (demo game world)
+          (demo shell core)
+          (demo selftest checks))
+
+  (export native-main)
+
+  (begin
+    (define KEYS (list 'left 'right 'up 'down 'a 'd 'w 's 'q 'e))
+
+    (define (arg-value args name)
+      (let ((m (member name args)))
+        (and m (pair? (cdr m)) (cadr m))))
+
+    (define (loop scaler)
+      (lambda ()
+        (gfx-setup)
+        (set-viewport #f)
+        (set-letterbox-color 0.0 0.0 0.0)
+        (let frame ()
+          (let* ((dt (wait-frame))
+                 (pt (core-playtest))
+                 ;; before the playtest reads this frame's keys: an Escape
+                 ;; that closes the note must not also quit
+                 (was-busy (playtest-busy? pt)))
+            (window-scaler-frame! scaler)
+            (playtest-frame! pt)
+            (unless (or was-busy (playtest-busy? pt))
+              (keys-poll! (core-keys) KEYS)
+              (when (key-pressed? 'escape) (request-quit)))
+            (core-frame! dt (frame-width) (frame-height) #t)
+            (unless (quit-requested?) (frame))))))
+
+    (define (native-main . _args)
+      (let ((args (cdr (command-line))))
+        (if (member "--selftest" args)
+            (exit (if (run-selftest 'desktop) 0 1))
+            (begin
+              (core-boot! (or (arg-value args "--build") "dev") 'desktop)
+              (let ((seen (arg-value args "--seen"))) (when seen (core-set-seen! seen)))
+              (let ((f (arg-value args "--version-json")))
+                (when f
+                  (let ((text (guard (e (#t #f)) (read-file-string f))))
+                    (display (string-append "substratic-demo: version.json "
+                                            (if (and text (updater-set-info! (core-updater) text)) "read" "unreadable")))
+                    (newline))))
+              (let* ((scaler (make-window-scaler VIEW-W VIEW-H
+                                                 remember: (lambda (v) (store-write-datum! "scale" v))))
+                     (k (window-open-scale scaler (store-read-datum "scale"))))
+                (run-game "Substratic demo" (* k VIEW-W) (* k VIEW-H) (loop scaler)))
+              0))))))

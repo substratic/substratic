@@ -3,7 +3,8 @@
 ;;; scale covers enough; and the window->view inverse.
 
 (import (sigil test)
-        (substratic view fit))
+        (substratic view fit)
+        (substratic view window))
 
 (test-group "view fit"
   (test "a 1000x621 canvas takes the 400x176 view at 2x, centered"
@@ -46,3 +47,19 @@
     (let ((f (view-fit 300 100 400 176 integer-only: #t)))
       (assert-equal 'integer (fit-mode f))
       (assert-equal 1 (fit-scale f)))))
+
+(test-group "view window: the remembered scale"
+  (test "scale symbols"
+    (assert-equal 'x3 (scale-symbol 3))
+    (assert-equal 3 (symbol-scale 'x3))
+    (assert-false (symbol-scale 'fullscreen))
+    (assert-false (symbol-scale 'x))
+    (assert-false (symbol-scale "x3")))
+  (test "the first time opens at the minimum"
+    (assert-equal 2 (window-open-scale (make-window-scaler 400 176) #f)))
+  (test "a remembered scale opens at it; one outside min..max opens at the minimum"
+    (assert-equal 4 (window-open-scale (make-window-scaler 400 176) 'x4))
+    (assert-equal 2 (window-open-scale (make-window-scaler 400 176) 'x1))
+    (assert-equal 3 (window-open-scale (make-window-scaler 400 176 min-scale: 3 max-scale: 5) 'x9)))
+  (test "a remembered fullscreen opens at the minimum"
+    (assert-equal 2 (window-open-scale (make-window-scaler 400 176) 'fullscreen))))
