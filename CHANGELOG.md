@@ -4,6 +4,9 @@
 
 - `examples/emberlight`: a tiny game made with Substratic, its showcase and
   integration test; the six-room demo stays as a test fixture.
+- `(substratic store settings)`: `version: #f` makes a table with no schema
+  version that never resets, for a game adopting the module with players
+  whose settings have no version key.
 - `(substratic input pad)`: a gamepad, natively through GLFW's gamepad API
   (a small C native), on the web through the browser's Gamepad API, which
   `substratic.js` now polls and sends as `("pad", ...)`.

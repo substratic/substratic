@@ -76,3 +76,14 @@
     (assert-true (settings-migrate! T2))
     (assert-equal 'on (settings-value T2 (settings-load T2) 'music))
     (assert-false (settings-migrate! T2))))
+
+(test-group "settings: no schema version"
+  (test "a table with version #f never resets, and writes no version key"
+    (fresh-root! "unversioned")
+    (store-write-datum! "music" 'off)
+    (store-write-datum! "hud" 'b)
+    (let ((t (make-settings-table ROWS version: #f retired: (list "hud"))))
+      (assert-false (settings-migrate! t))
+      (assert-equal 'off (settings-value t (settings-load t) 'music))
+      (assert-equal 'b (store-read-datum "hud"))
+      (assert-false (store-get "settings-version")))))

@@ -19,6 +19,11 @@
 ;;; on). Bump it when a default changes and every player should see the new
 ;;; one. Nothing else in the store is touched.
 ;;;
+;;; A table made with version: #f has no schema version and never resets:
+;;; for a game that already has players whose store holds settings but no
+;;; version key (the reset would take their settings once, on the update
+;;; that adopts this module). Such a table can take a version later.
+;;;
 ;;; Extracted from Crash The Stack's (crash settings), which kept its rows
 ;;; in the module and its load and save in its shell; here both are the
 ;;; table's.
@@ -97,7 +102,8 @@
 
     ;; The one-time reset described above. #t when it reset.
     (define (settings-migrate! t)
-      (if (eqv? (store-read-datum (settings-table-version-key t)) (settings-table-version t))
+      (if (or (not (settings-table-version t))
+              (eqv? (store-read-datum (settings-table-version-key t)) (settings-table-version t)))
           #f
           (begin
             (for-each (lambda (st) (store-remove! (setting-key st))) (settings-table-rows t))
