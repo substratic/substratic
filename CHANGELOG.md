@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: 0.1.0
+## 0.1.0 (2026-09-25)
 
 The first modules, extracted from Crash The Stack and Harkfell, and the
 playtest reports.
@@ -20,6 +20,7 @@ playtest reports.
   the desktop comparison, and the once-per-version "new in" line.
 - `(substratic playtest session)`: F1 readout, F2 report (screenshot,
   report.json, a typed note), natively and on the web.
+- `(substratic web params)`: the page's URL parameters as key and value.
 - `(substratic data json)`, `(substratic image png)`,
   `(substratic image capture)`, `(substratic text font)`: what those need.
 - `web/index.template.html` and `assets/substratic/substratic.js`: a page

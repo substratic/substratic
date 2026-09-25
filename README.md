@@ -30,6 +30,7 @@ Every module is `(substratic <area> <concept>)`.
 | `(substratic update version)` | version.json parsed; versions compared |
 | `(substratic update check)` | Whether to show "a new version is ready" or "new in X.Y.Z", once per version |
 | `(substratic playtest session)` | F1: a location readout. F2: a report with a screenshot, report.json and a typed note |
+| `(substratic web params)` | The page's URL parameters, each split into key and value |
 | `(substratic data json)` | JSON in and out, small |
 | `(substratic image png)` | RGBA pixels to PNG |
 | `(substratic image capture)` | The frame just drawn, read back natively (a C native) |
