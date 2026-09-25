@@ -132,8 +132,6 @@
             (line (core-update-line)))
         (begin-frame)
         (set-blend-mode 'normal)
-        (set-color 0.0 0.0 0.0 1.0)
-        (draw-filled-rect 0 0 win-w win-h)
         (with-render-target *rt*
           (set-blend-mode 'normal)
           (draw-world! *world* line))

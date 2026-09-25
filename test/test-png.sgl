@@ -8,7 +8,8 @@
         (sigil fs)
         (sigil time)
         (sigil graphics image)
-        (substratic image png))
+        (substratic image png)
+        (substratic image capture))
 
 (define (ascii-bv s)
   (let* ((n (string-length s)) (bv (make-bytevector n 0)))
@@ -79,3 +80,13 @@
       (assert-equal (bytevector 3 3 3 3  4 4 4 4
                                 1 1 1 1  2 2 2 2)
                     (flip-rows 2 2 bv)))))
+
+(test-group "png: the C encoder writes the same file"
+  (test "byte for byte, rows top first, across block boundaries"
+    (let ((px (card 300 250)))
+      (assert-equal (rgba->png 300 250 px) (encode-png 300 250 px))))
+  (test "rows bottom first, flipped by the C encoder, match flip-rows"
+    (let ((px (card 7 5)))
+      (assert-equal (rgba->png 7 5 (flip-rows 7 5 px)) (%encode-png 7 5 px #t))))
+  (test "a size that does not match is an error"
+    (assert-true (guard (e (#t #t)) (encode-png 2 2 (make-bytevector 3 0)) #f))))

@@ -1,18 +1,32 @@
-;;; (substratic image capture) - The frame just drawn, as pixels.
+;;; (substratic image capture) - The frame just drawn, as pixels or as a
+;;; PNG.
 ;;;
 ;;; capture-frame reads the window's framebuffer after the frame's
 ;;; end-frame and before the next wait-frame: w*h*4 RGBA8 bytes, rows top
 ;;; first, or #f (no GL context, a GL error, or the web, where the page
-;;; takes the screenshot from the canvas). %capture-frame is the C native
-;;; (src/c/capture.c), rows bottom first.
+;;; takes the screenshot from the canvas). capture-frame-png is the same
+;;; frame as a PNG file's bytes. encode-png turns any RGBA8 pixels (rows top
+;;; first) into a PNG.
+;;;
+;;; The reading and the encoding are C natives (src/c/capture.c): the
+;;; encoder writes exactly what (substratic image png)'s rgba->png writes,
+;;; in milliseconds instead of the seconds a per-byte loop takes in the
+;;; bytecode VM.
 
 (define-library (substratic image capture)
   (import (sigil core)
           (substratic image png))
 
-  (export %capture-frame capture-frame)
+  (export %capture-frame %encode-png capture-frame capture-frame-png encode-png)
 
   (begin
     (define (capture-frame w h)
       (let ((raw (guard (e (#t #f)) (%capture-frame w h))))
-        (and raw (flip-rows w h raw))))))
+        (and raw (flip-rows w h raw))))
+
+    (define (capture-frame-png w h)
+      (let ((raw (guard (e (#t #f)) (%capture-frame w h))))
+        (and raw (%encode-png w h raw #t))))
+
+    (define (encode-png w h rgba)
+      (%encode-png w h rgba #f))))

@@ -93,12 +93,122 @@ static Value native_capture_frame(SigilVM *vm, int argc, Value *args)
 
 #endif
 
+
+/*
+ * (%encode-png w h rgba bottom-first?) -> the PNG file's bytes
+ *
+ * The same file (substratic image png)'s rgba->png writes, byte for byte
+ * (test/test-png.sgl holds the two to that): 8-bit RGBA, filter 0 on every
+ * row, a zlib stream of stored deflate blocks. Here in C because a
+ * per-byte loop in the bytecode VM took 12 s for a 640x352 frame, during
+ * which the game stood still. Pure C, so every target has it.
+ */
+static uint32_t crc_table[256];
+static int crc_ready = 0;
+
+static void crc_init(void)
+{
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc_table[n] = c;
+    }
+    crc_ready = 1;
+}
+
+static uint32_t crc_update(uint32_t crc, const uint8_t *p, size_t n)
+{
+    uint32_t c = crc ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = crc_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static uint8_t *put32(uint8_t *o, uint32_t v)
+{
+    o[0] = (uint8_t)(v >> 24); o[1] = (uint8_t)(v >> 16); o[2] = (uint8_t)(v >> 8); o[3] = (uint8_t)v;
+    return o + 4;
+}
+
+static Value native_encode_png(SigilVM *vm, int argc, Value *args)
+{
+    (void)argc;
+    if (!sigil_is_fixnum(args[0]) || !sigil_is_fixnum(args[1]) || !sigil_is_bytevector(args[2])) {
+        sigil__vm_set_error(vm, SIGIL_ERR_TYPE, "%encode-png: expected width, height, bytevector");
+        return SIGIL_UNDEFINED;
+    }
+    long w = (long)sigil_as_fixnum(args[0]);
+    long h = (long)sigil_as_fixnum(args[1]);
+    int flip = !(args[3] == SIGIL_FALSE);
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
+        sigil_bytevector_length(args[2]) != (size_t)w * (size_t)h * 4u) {
+        sigil__vm_set_error(vm, SIGIL_ERR_TYPE, "%encode-png: the bytevector is not w*h*4 bytes");
+        return SIGIL_UNDEFINED;
+    }
+    if (!crc_ready) crc_init();
+
+    size_t row = (size_t)w * 4u;
+    size_t raw = (size_t)h * (row + 1u);
+    size_t blocks = (raw + 65534u) / 65535u;
+    size_t zlen = 2u + 5u * blocks + raw + 4u;
+    size_t total = 8u + (12u + 13u) + (12u + zlen) + 12u;
+
+    Value out = sigil_make_bytevector(vm, total);
+    if (!sigil_is_bytevector(out)) return SIGIL_FALSE;
+    /* the allocation may move nothing we hold but the input: fetch it after */
+    const uint8_t *px = sigil_bytevector_data(args[2]);
+    uint8_t *o = sigil_bytevector_data(out);
+
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    memcpy(o, sig, 8); o += 8;
+
+    /* IHDR */
+    uint8_t *chunk = o;
+    o = put32(o, 13); memcpy(o, "IHDR", 4); o += 4;
+    o = put32(o, (uint32_t)w); o = put32(o, (uint32_t)h);
+    *o++ = 8; *o++ = 6; *o++ = 0; *o++ = 0; *o++ = 0;
+    o = put32(o, crc_update(0, chunk + 4, 17));
+
+    /* IDAT: the zlib stream, the scanlines streamed through stored blocks */
+    chunk = o;
+    o = put32(o, (uint32_t)zlen); memcpy(o, "IDAT", 4); o += 4;
+    *o++ = 0x78; *o++ = 0x01;
+    uint32_t a = 1, b = 0;
+    size_t pos = 0;                         /* position in the raw scanline stream */
+    for (size_t k = 0; k < blocks; k++) {
+        size_t len = raw - pos < 65535u ? raw - pos : 65535u;
+        *o++ = (k == blocks - 1) ? 1 : 0;
+        *o++ = (uint8_t)(len & 0xFF); *o++ = (uint8_t)(len >> 8);
+        *o++ = (uint8_t)(~len & 0xFF); *o++ = (uint8_t)((~len >> 8) & 0xFF);
+        for (size_t i = 0; i < len; i++, pos++) {
+            size_t y = pos / (row + 1u), x = pos % (row + 1u);
+            uint8_t v = 0;
+            if (x > 0) {
+                size_t sy = flip ? (size_t)h - 1u - y : y;
+                v = px[sy * row + (x - 1u)];
+            }
+            *o++ = v;
+            a = (a + v) % 65521u; b = (b + a) % 65521u;
+        }
+    }
+    o = put32(o, (b << 16) | a);
+    o = put32(o, crc_update(0, chunk + 4, 4 + zlen));
+
+    /* IEND */
+    chunk = o;
+    o = put32(o, 0); memcpy(o, "IEND", 4); o += 4;
+    o = put32(o, crc_update(0, chunk + 4, 4));
+    return out;
+}
+
 void sigil__init_substratic_image_capture_module(SigilVM *vm)
 {
     SigilModule *module = sigil_begin_module(vm, "(substratic image capture)");
     if (!module) return;
     sigil_module_register_native(vm, "%capture-frame", native_capture_frame,
                                  SIGIL_ARITY_EXACT(2), "Read the frame just drawn as RGBA8, rows bottom first");
+    sigil_module_register_native(vm, "%encode-png", native_encode_png,
+                                 SIGIL_ARITY_EXACT(4), "RGBA8 bytes to a PNG file's bytes");
     sigil_module_export(vm, "%capture-frame");
+    sigil_module_export(vm, "%encode-png");
     sigil_end_module(vm);
 }

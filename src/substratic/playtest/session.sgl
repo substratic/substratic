@@ -64,7 +64,8 @@
                   (sigil graphics)
                   (substratic text font)
                   (substratic data json)
-                  (substratic store kv)))
+                  (substratic store kv)
+                  (substratic image capture)))
     (else (import (sigil struct)
                   (sigil math)
                   (sigil list)
@@ -110,7 +111,7 @@
       (last-input default: #f mutable: #t)
       (phase default: 'idle mutable: #t)   ; idle, pending, note (desktop), page (web)
       (taken default: #f mutable: #t)      ; the report's alist, taken at F2
-      (pixels default: #f mutable: #t)     ; (w h rgba-top-first) or #f
+      (pixels default: #f mutable: #t)     ; the screenshot as PNG bytes, or #f
       (note default: "" mutable: #t)
       (message default: #f mutable: #t)
       (message-left default: 0 mutable: #t)
@@ -268,13 +269,14 @@
         (set-playtest-note! p "")
         (set-playtest-phase! p 'pending)))
 
-    (define (read-pixels p w h)
-      (cond ((playtest-capturer p) ((playtest-capturer p) w h))
+    ;; The frame as PNG bytes, or #f.
+    (define (read-png p w h)
+      (cond ((playtest-capturer p) (let ((px ((playtest-capturer p) w h))) (and px (encode-png w h px))))
             (else (native-capture w h))))
 
     (cond-expand
       (wasm (define (native-capture w h) #f))
-      (else (define (native-capture w h) (capture-frame w h))))
+      (else (define (native-capture w h) (capture-frame-png w h))))
 
     ;; After the frame's end-frame, with the framebuffer's size. Desktop:
     ;; the pixels, then the note field. Web: the capture line for the page.
@@ -288,8 +290,8 @@
               (display (string-append CAPTURE-PREFIX (datum->json (playtest-taken p))))
               (newline)
               (set-playtest-phase! p 'page))
-            (let ((px (guard (e (#t #f)) (read-pixels p w h))))
-              (set-playtest-pixels! p (and px (list w h px)))
+            (let ((png (guard (e (#t #f)) (read-png p w h))))
+              (set-playtest-pixels! p png)
               (set-playtest-phase! p 'note)))))
 
     (define (clear! p)
@@ -313,14 +315,17 @@
            (let ((d (if (= n 1) base (string-append base "-" (number->string n)))))
              (if (file-exists? d) (loop (+ n 1)) d))))
        (define (write-report! p)
-         (guard (e (#t (say! p (string-append "report NOT saved: " (condition->text e))) #f))
+         (guard (e (#t (let ((why (string-append "report NOT saved: " (condition->text e))))
+                         (say! p why)
+                         (display (string-append "substratic: playtest " why)) (newline))
+                       #f))
            (let* ((dir (free-dir (string-append (store-root) "/reports/" (report-stamp))))
                   (px (playtest-pixels p))
                   (shot (and px "screenshot.png")))
              (ensure-directory dir)
              (when px
                (write-file-bytes (string-append dir "/screenshot.png")
-                                 (rgba->png (car px) (cadr px) (caddr px))))
+                                 px))
              (write-file-bytes (string-append dir "/report.json")
                                (string->utf8 (playtest-report-json p (playtest-note p) shot)))
              dir)))))
