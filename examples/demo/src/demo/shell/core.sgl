@@ -97,7 +97,11 @@
           (set! *line-info* info)
           (set! *line-waiting* (updater-waiting? *updater*))
           (let ((status (updater-status *updater* *last-seen*)))
-            (set! *line* (updater-line *updater* status))
+            (let ((new (updater-line *updater* status)))
+              (unless (equal? new *line*)
+                (display (string-append "substratic-demo: update " (symbol->string status) " " (or new "-")))
+                (newline))
+              (set! *line* new))
             ;; once per version: the line stays up this session, and is
             ;; never shown again; a first launch just records the version
             (when (or (eq? status 'new-in) (and (not *last-seen*) info))

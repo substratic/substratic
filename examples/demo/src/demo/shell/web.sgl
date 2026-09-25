@@ -6,7 +6,7 @@
 ;;;   ?selftest          run the engine's checks on this target and print them
 ;;;   ?update=waiting    act as if a service worker had an update waiting
 ;;;   ?seen=VERSION      pretend the last version seen was VERSION
-;;;   ?build=STAMP       the build stamp for the readout
+;;;   ?trace-keys        print each key that reaches the game
 ;;; and prints every parameter it is given ("substratic-demo: param ..."),
 ;;; so a check can see the page forwarded it.
 
@@ -27,6 +27,7 @@
     (define *last-ms* #f)
     (define *selftest* #f)
     (define *said-ready* #f)
+    (define *trace-keys* #f)     ; ?trace-keys: print each key that reaches the game
 
     (define (frame-dt payload)
       (let* ((ms (or (string->number payload) 0.0))
@@ -43,7 +44,8 @@
              (v (if i (substring kv (+ i 1) (string-length kv)) "")))
         (cond ((string=? k "selftest") (set! *selftest* #t))
               ((and (string=? k "update") (string=? v "waiting")) (updater-set-waiting! (core-updater) #t))
-              ((string=? k "seen") (core-set-seen! v)))))
+              ((string=? k "seen") (core-set-seen! v))
+              ((string=? k "trace-keys") (set! *trace-keys* #t)))))
 
     (define (tick! payload)
       (gles3-resize-to-display)
@@ -71,5 +73,7 @@
             ((string=? type "param") (param! payload) 0)
             ((playtest-dispatch! (core-playtest) type payload) 1)
             ((updater-dispatch! (core-updater) type payload) 1)
-            ((input-dispatch! (core-keys) (core-sticks) type payload) 1)
+            ((input-dispatch! (core-keys) (core-sticks) type payload)
+             (when (and *trace-keys* (string=? type "keydown")) (say "key " payload))
+             1)
             (else 0)))))
