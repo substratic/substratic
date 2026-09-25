@@ -1,0 +1,71 @@
+;;; (emberlight shell native) - The desktop: a sigil-desktop window at whole
+;;; scales of the 256x144 room, remembered (x3 the first time).
+;;;
+;;;   emberlight                     play (arrows or WASD, a gamepad; Space or A
+;;;                                  starts a round; P changes the palette; F1 the
+;;;                                  readout, F2 a report; F11 fullscreen; Escape quits)
+;;;   emberlight --no-playtest       without F1 and F2
+;;;   emberlight --version-json FILE read version.json from FILE (the desktop
+;;;                                  compares it with this version)
+;;;   emberlight --seen VERSION      pretend the last version seen was VERSION
+;;;   emberlight --build STAMP       the build stamp for the readout
+
+(define-library (emberlight shell native)
+  (import (sigil io)
+          (sigil fs)
+          (sigil process)
+          (sigil desktop)
+          (sigil graphics)
+          (substratic view window)
+          (substratic input keys)
+          (substratic input pad)
+          (substratic store kv)
+          (substratic update check)
+          (substratic playtest session)
+          (emberlight game world)
+          (emberlight shell core))
+
+  (export native-main)
+
+  (begin
+    (define KEYS (list 'left 'right 'up 'down 'a 'd 'w 's 'space 'return 'p))
+
+    (define (arg-value args name)
+      (let ((m (member name args)))
+        (and m (pair? (cdr m)) (cadr m))))
+
+    (define (loop scaler)
+      (lambda ()
+        (gfx-setup)
+        (set-viewport #f)
+        (set-letterbox-color 0.0 0.0 0.0)
+        (let frame ()
+          (let* ((dt (wait-frame))
+                 (pt (core-playtest))
+                 ;; before the playtest reads this frame's keys: an Escape
+                 ;; that closes the note must not also quit
+                 (was-busy (playtest-busy? pt)))
+            (unless was-busy (window-scaler-frame! scaler))
+            (playtest-frame! pt)
+            (pad-poll! (core-pad))
+            (unless (or was-busy (playtest-busy? pt))
+              (keys-poll! (core-keys) KEYS)
+              (when (key-pressed? 'escape) (request-quit)))
+            (core-frame! dt (frame-width) (frame-height) #t)
+            (unless (quit-requested?) (frame))))))
+
+    (define (native-main . _args)
+      (let ((args (cdr (command-line))))
+        (core-boot! (or (arg-value args "--build") "dev") 'desktop (not (member "--no-playtest" args)))
+        (let ((seen (arg-value args "--seen"))) (when seen (core-set-seen! seen)))
+        (let ((f (arg-value args "--version-json")))
+          (when f
+            (let ((text (guard (e (#t #f)) (read-file-string f))))
+              (display (string-append "emberlight: version.json "
+                                      (if (and text (updater-set-info! (core-updater) text)) "read" "unreadable")))
+              (newline))))
+        (let* ((scaler (make-window-scaler VIEW-W VIEW-H min-scale: 3 max-scale: 8
+                                           remember: (lambda (v) (store-write-datum! "scale" v))))
+               (k (window-open-scale scaler (store-read-datum "scale"))))
+          (run-game "Emberlight" (* k VIEW-W) (* k VIEW-H) (loop scaler)))
+        0))))

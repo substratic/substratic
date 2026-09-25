@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- Emberlight's page: substratic's template (web/index.template.html) with its own title,
+     icons and one touch stick. __VERSION__ is stamped by the build. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="substratic-version" content="__VERSION__">
+  <title>Emberlight</title>
+  <link rel="icon" href="assets/icons/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" href="assets/icons/favicon-32.png" sizes="32x32">
+  <link rel="apple-touch-icon" href="assets/icons/substratic-icon-192.png">
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+                 overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+    #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+             display: block; touch-action: none; user-select: none;
+             -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+    #status { position: fixed; left: 8px; bottom: 8px; color: #c9a37a; font: 13px ui-monospace, monospace; }
+    #status:empty, #status [data-sigil-booting] { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="stage" tabindex="0"></canvas>
+  <div id="status"></div>
+  <script>
+  // What this game's page has. Every key is optional; see substratic.js.
+  window.SUBSTRATIC = {
+    canvas: "#stage",
+    sticks: [{ name: "move", zone: "any" }],   // one stick, wherever the thumb lands
+    buttons: [],
+    playtest: "param",          // ?playtest turns the report on
+    reportUrl: "playtest-report",
+    versionUrl: "version.json",
+    fullscreen: true,
+    gamepad: true
+  };
+  </script>
+  <script src="assets/substratic/substratic.js"></script>
+  <!--sigil:app-->
+</body>
+</html>

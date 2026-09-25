@@ -1,0 +1,24 @@
+;;; (emberlight main) - The entry, and the seam between the two targets:
+;;; (emberlight shell web) on the web config, (emberlight shell native)
+;;; otherwise.
+
+(define-library (emberlight main)
+  (import (sigil core))
+  (cond-expand
+    (wasm (import (emberlight shell web)))
+    (else (import (emberlight shell native))))
+
+  (export main sigil-web-dispatch-event)
+
+  (begin
+    (cond-expand
+      (wasm
+       (define (main . args)
+         (web-main))
+       (define (sigil-web-dispatch-event type payload)
+         (web-dispatch type payload)))
+      (else
+       (define (main . args)
+         (apply native-main args))
+       (define (sigil-web-dispatch-event type payload)
+         0)))))

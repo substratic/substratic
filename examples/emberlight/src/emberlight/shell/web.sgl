@@ -1,0 +1,74 @@
+;;; (emberlight shell web) - The browser: one frame per requestAnimationFrame
+;;; dispatch, the page's events in between.
+;;;
+;;; Every URL parameter arrives as ("param", "KEY=VALUE") from the page. The
+;;; game reads:
+;;;   ?playtest          F1 and F2 (and the page's report buttons)
+;;;   ?update=waiting    act as if a service worker had an update waiting
+;;;   ?seen=VERSION      pretend the last version seen was VERSION
+;;;   ?trace-keys        print each key that reaches the game
+;;; and prints every parameter it is given ("emberlight: param ...").
+
+(define-library (emberlight shell web)
+  (import (sigil core)
+          (sigil string)
+          (sigil graphics)
+          (sigil browser gles3)
+          (substratic input events)
+          (substratic input pad)
+          (substratic web params)
+          (substratic update check)
+          (substratic playtest session)
+          (emberlight shell core))
+
+  (export web-main web-dispatch)
+
+  (begin
+    (define *last-ms* #f)
+    (define *said-ready* #f)
+    (define *trace-keys* #f)
+
+    (define (frame-dt payload)
+      (let* ((ms (or (string->number payload) 0.0))
+             (dt (if *last-ms* (/ (- ms *last-ms*) 1000.0) (/ 1.0 60.0))))
+        (set! *last-ms* ms)
+        (if (or (< dt 0.0) (> dt 0.25)) (/ 1.0 60.0) dt)))
+
+    (define (say . parts) (display (apply string-append "emberlight: " parts)) (newline))
+
+    (define (param! kv)
+      (say "param " kv)
+      (let* ((p (split-param kv)) (k (car p)) (v (or (cdr p) "")))
+        (cond ((string=? k "playtest") (playtest-set-enabled! (core-playtest) #t))
+              ((and (string=? k "update") (string=? v "waiting")) (updater-set-waiting! (core-updater) #t))
+              ((string=? k "seen") (core-set-seen! v))
+              ((string=? k "trace-keys") (set! *trace-keys* #t)))))
+
+    (define (tick! payload)
+      (gles3-resize-to-display)
+      (core-frame! (frame-dt payload) (gles3-canvas-width) (gles3-canvas-height) #f)
+      (unless *said-ready*
+        (set! *said-ready* #t)
+        (say "ready")))
+
+    (define (web-main)
+      (unless (gles3-use-canvas "#stage")
+        (error "emberlight: no WebGL2 context for #stage"))
+      (core-boot! "web" 'web #f)
+      (gles3-resize-to-display)
+      (gfx-setup)
+      (gles3-start-loop "emberlight-tick")
+      0)
+
+    ;; The playtest first (F1 and F2, and every key while a report is open),
+    ;; then the updater, the gamepad, the keys and the stick.
+    (define (web-dispatch type payload)
+      (cond ((string=? type "frame") (tick! payload) 0)
+            ((string=? type "param") (param! payload) 0)
+            ((playtest-dispatch! (core-playtest) type payload) 1)
+            ((updater-dispatch! (core-updater) type payload) 1)
+            ((pad-dispatch! (core-pad) type payload) 1)
+            ((input-dispatch! (core-keys) (core-sticks) type payload)
+             (when (and *trace-keys* (string=? type "keydown")) (say "key " payload))
+             1)
+            (else 0)))))

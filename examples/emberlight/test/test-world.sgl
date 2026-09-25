@@ -1,0 +1,80 @@
+;;; Emberlight's world: rounds, catches and misses, the light, the end of a
+;;; round, and determinism.
+
+(import (sigil test)
+        (sigil list)
+        (substratic time tween)
+        (emberlight game world))
+
+(define STILL (list 0.0 0.0 #f))
+(define START (list 0.0 0.0 #t))
+
+(define (run w n input)
+  (let loop ((w w) (i 0)) (if (= i n) w (loop (world-step w input) (+ i 1)))))
+
+;; The first ember a round spawns, and a world whose moth sits on it.
+(define (with-ember)
+  (let loop ((w (world-step (world-new) START)) (i 0))
+    (if (or (pair? (world-embers w)) (> i 200)) w (loop (world-step w STILL) (+ i 1)))))
+
+(test-group "emberlight: a round"
+  (test "the title waits for a start; a start begins round 1 with 60 s"
+    (let ((w (run (world-new) 30 STILL)))
+      (assert-equal 'title (world-phase w))
+      (let ((w (world-step w START)))
+        (assert-equal 'play (world-phase w))
+        (assert-equal 1 (world-round w))
+        (assert-equal ROUND-TICKS (world-left w)))))
+  (test "a round ends after 60 s of ticks"
+    (let ((w (run (world-step (world-new) START) ROUND-TICKS STILL)))
+      (assert-equal 'over (world-phase w))))
+  (test "the end screen takes a start only after a second"
+    (let* ((over (run (world-step (world-new) START) ROUND-TICKS STILL))
+           (early (world-step over START))
+           (late (world-step (run over 70 STILL) START)))
+      (assert-equal 'over (world-phase early))
+      (assert-equal 'play (world-phase late))
+      (assert-equal 2 (world-round late)))))
+
+(test-group "emberlight: embers"
+  (test "embers appear in the first seconds"
+    (assert-true (pair? (world-embers (with-ember)))))
+  (test "touching an ember catches it: the score and the light go up"
+    (let* ((w (with-ember))
+           (e (car (world-embers w)))
+           (on (world w moth-x: (ember-x e) moth-y: (ember-y e)))
+           (after (world-step on STILL)))
+      (assert-equal 1 (world-caught after))
+      (assert-true (> (world-light after) (world-light w)))
+      (assert-equal 'caught (ember-state (car (world-embers after))))))
+  (test "an ember left alone burns out: a miss, and the light shrinks"
+    (let* ((w (with-ember))
+           (e (car (world-embers w)))
+           ;; park the moth in a corner far from it, and wait out its life
+           (away (world w moth-x: (if (> (ember-x e) 128.0) 6.0 250.0) moth-y: (if (> (ember-y e) 72.0) 14.0 140.0)))
+           (after (run away (+ (ember-life e) 1) STILL)))
+      (assert-true (>= (world-missed after) 1))
+      (assert-true (< (world-light after) (world-light w)))))
+  (test "the light's growth is a tween over ticks, not a jump"
+    (let* ((w (with-ember))
+           (e (car (world-embers w)))
+           (after (world-step (world w moth-x: (ember-x e) moth-y: (ember-y e)) STILL))
+           (shown0 (tween-value (world-light-shown after) 0.0))
+           (shown1 (tween-value (world-light-shown (run after 30 STILL)) 0.0)))
+      (assert-true (< shown0 (world-light after)))
+      (assert-true (< (abs (- shown1 (world-light after))) 1.0)))))
+
+(test-group "emberlight: determinism"
+  (test "the same inputs give the same round"
+    (define (play)
+      (let loop ((w (world-step (world-new) START)) (i 0))
+        (if (= i 1200)
+            (list (world-moth-x w) (world-moth-y w) (world-caught w) (world-missed w) (length (world-embers w)))
+            (loop (world-step w (list (if (< (modulo i 200) 100) 1.0 -1.0) (if (< (modulo i 90) 45) 0.6 -0.6) #f))
+                  (+ i 1)))))
+    (assert-equal (play) (play)))
+  (test "round 2 is not round 1 (a new seed)"
+    (let* ((r1 (with-ember))
+           (r2 (let loop ((w (world-step (run (run (world-step (world-new) START) ROUND-TICKS STILL) 70 STILL) START)) (i 0))
+                 (if (or (pair? (world-embers w)) (> i 200)) w (loop (world-step w STILL) (+ i 1))))))
+      (assert-false (= (ember-x (car (world-embers r1))) (ember-x (car (world-embers r2))))))))

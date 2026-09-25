@@ -1,0 +1,200 @@
+;;; (emberlight game world) - A moth, drifting embers, a pool of light.
+;;;
+;;; One dark room, 256x144. The moth is steered by one analogue input.
+;;; Embers appear in the dark, drift, pulse, and burn out after a few
+;;; seconds. Touching one catches it: the score goes up and the pool of
+;;; light around the moth grows. One that burns out uncaught is a miss, and
+;;; the dark closes in. A round is 60 seconds.
+;;;
+;;; Pure and deterministic: a round is seeded, and the same inputs from the
+;;; same state give the same state, tick by tick (1/60 s). The tweens
+;;; (substratic time tween) advance by ticks, so the flares, the score's pop
+;;; and the light's growth are part of the state, not of the frame rate.
+
+(define-library (emberlight game world)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
+          (substratic time tween))
+
+  (export VIEW-W VIEW-H ROUND-TICKS
+          world world? world-new world-phase world-tick world-left world-moth-x world-moth-y
+          world-light world-light-shown world-embers world-caught world-missed world-pop world-round
+          ember ember? ember-x ember-y ember-age ember-life ember-state ember-fx
+          world-step world-start describe snapshot)
+
+  (begin
+    (define VIEW-W 256)
+    (define VIEW-H 144)
+    (define ROUND-TICKS 3600)          ; 60 s
+    (define MAX-EMBERS 6)
+    (define CATCH-R 7.0)               ; px between moth and ember to catch it
+    (define LIGHT-START 34)
+    (define LIGHT-MIN 14)
+    (define LIGHT-MAX 90)
+    (define LIGHT-GAIN 6)
+    (define LIGHT-LOSS 5)
+    (define ACCEL 0.28)
+    (define DRAG 0.86)
+
+    ;; state: 'alive, 'caught (flaring out), 'burnt (fading out).
+    ;; fx: the tween of the flare or the fade, 0..1.
+    (define-struct ember
+      (x default: 0.0) (y default: 0.0) (vx default: 0.0) (vy default: 0.0)
+      (age default: 0) (life default: 300)
+      (state default: 'alive)
+      (fx default: #f))
+
+    ;; phase: 'title, 'play or 'over. left: ticks left in the round.
+    ;; light: the pool's radius the game is heading for; light-shown: the
+    ;; tween towards it. pop: the score's pop, a tween 1.6 -> 1.0.
+    (define-struct world
+      (phase default: 'title)
+      (tick default: 0)
+      (round default: 0)
+      (rng default: 1)
+      (left default: 3600)
+      (moth-x default: 128.0) (moth-y default: 72.0)
+      (vx default: 0.0) (vy default: 0.0)
+      (light default: 34)
+      (light-shown default: #f)
+      (embers default: '())
+      (next-spawn default: 30)
+      (caught default: 0)
+      (missed default: 0)
+      (pop default: #f))
+
+    (define (still light) (tween-new (* 1.0 light) (* 1.0 light) 1 'linear))
+
+    (define (world-new) (world light-shown: (still LIGHT-START) pop: (tween-new 1.0 1.0 1 'linear)))
+
+    ;; --- a small deterministic generator (MINSTD) ------------------------------
+
+    (define (rng-next s) (modulo (* s 48271) 2147483647))
+    ;; (value . next-seed): value in lo..hi
+    (define (rng-range s lo hi)
+      (let ((n (rng-next s)))
+        (cons (+ lo (* (- hi lo) (/ (modulo n 100000) 100000.0))) n)))
+
+    ;; --- the round ---------------------------------------------------------------
+
+    ;; A new round from the title or the end screen.
+    (define (world-start w)
+      (let ((r (+ (world-round w) 1)))
+        (world (world-new)
+               phase: 'play
+               tick: (world-tick w)
+               round: r
+               rng: (+ 1 (* r 7919))
+               left: ROUND-TICKS
+               light: LIGHT-START)))
+
+    (define (light-tween w target)
+      (tween-new (tween-value (world-light-shown w) 0.0) (* 1.0 target) 24 'out-quad))
+
+    (define (spawn w)
+      (let* ((a (rng-range (world-rng w) 12.0 (- VIEW-W 12.0)))
+             (b (rng-range (cdr a) 14.0 (- VIEW-H 12.0)))
+             (c (rng-range (cdr b) -0.25 0.25))
+             (d (rng-range (cdr c) -0.3 -0.05))
+             (e (rng-range (cdr d) 240.0 420.0))
+             (f (rng-range (cdr e) 25.0 70.0)))
+        (world w
+               embers: (cons (ember x: (car a) y: (car b) vx: (car c) vy: (car d)
+                                    life: (exact (round (car e))))
+                             (world-embers w))
+               next-spawn: (exact (round (car f)))
+               rng: (cdr f))))
+
+    (define (near? w e)
+      (let ((dx (- (ember-x e) (world-moth-x w))) (dy (- (ember-y e) (world-moth-y w))))
+        (< (+ (* dx dx) (* dy dy)) (* CATCH-R CATCH-R))))
+
+    ;; Every ember one tick on: drift, age, a catch, a burn-out, a finished fx.
+    (define (step-embers w)
+      (let loop ((es (world-embers w)) (keep '()) (caught 0) (missed 0))
+        (if (null? es)
+            (list (reverse keep) caught missed)
+            (let ((e (car es)))
+              (case (ember-state e)
+                ((alive)
+                 (let* ((x (+ (ember-x e) (ember-vx e)))
+                        (y (+ (ember-y e) (ember-vy e)))
+                        (e (ember e x: (if (< x 4.0) 4.0 (if (> x (- VIEW-W 4.0)) (- VIEW-W 4.0) x))
+                                    y: (if (< y 10.0) (+ y 1.0) y)
+                                    vy: (if (< y 10.0) 0.1 (ember-vy e))
+                                    age: (+ (ember-age e) 1))))
+                   (cond ((near? w e)
+                          (loop (cdr es) (cons (ember e state: 'caught fx: (tween-new 0.0 1.0 24 'out-quad)) keep)
+                                (+ caught 1) missed))
+                         ((>= (ember-age e) (ember-life e))
+                          (loop (cdr es) (cons (ember e state: 'burnt fx: (tween-new 0.0 1.0 30 'linear)) keep)
+                                caught (+ missed 1)))
+                         (else (loop (cdr es) (cons e keep) caught missed)))))
+                (else
+                 (let ((fx (tween-tick (ember-fx e))))
+                   (if (tween-done? fx)
+                       (loop (cdr es) keep caught missed)
+                       (loop (cdr es) (cons (ember e fx: fx) keep) caught missed)))))))))
+
+    (define (alive-count w) (length (filter (lambda (e) (eq? (ember-state e) 'alive)) (world-embers w))))
+
+    (define (clamp v lo hi) (if (< v lo) lo (if (> v hi) hi v)))
+
+    ;; One tick. input: (list dx dy start?), dx dy in -1..1; start? begins a
+    ;; round from the title or the end screen.
+    (define (world-step w input)
+      (let ((w (world w tick: (+ (world-tick w) 1)
+                        light-shown: (tween-tick (world-light-shown w))
+                        pop: (tween-tick (world-pop w)))))
+        (case (world-phase w)
+          ((play) (play-step w input))
+          ;; the end screen counts on (left goes negative) and takes a start
+          ;; only after a second, so a stick still held from the round does
+          ;; not start the next one
+          (else
+           (let ((w (if (eq? (world-phase w) 'over) (world w left: (- (world-left w) 1)) w)))
+             (if (and (caddr input) (or (eq? (world-phase w) 'title) (< (world-left w) -60)))
+                 (world-start w)
+                 w))))))
+
+    (define (play-step w input)
+      (let* ((vx (* DRAG (+ (world-vx w) (* ACCEL (car input)))))
+             (vy (* DRAG (+ (world-vy w) (* ACCEL (cadr input)))))
+             (x (clamp (+ (world-moth-x w) vx) 4.0 (- VIEW-W 4.0)))
+             (y (clamp (+ (world-moth-y w) vy) 12.0 (- VIEW-H 4.0)))
+             (w (world w moth-x: x moth-y: y vx: vx vy: vy left: (- (world-left w) 1)))
+             (w (if (and (<= (world-next-spawn w) 0) (< (alive-count w) MAX-EMBERS))
+                    (spawn w)
+                    (world w next-spawn: (- (world-next-spawn w) 1))))
+             (r (step-embers w))
+             (caught (cadr r))
+             (missed (caddr r))
+             (target (clamp (+ (world-light w) (* LIGHT-GAIN caught) (- (* LIGHT-LOSS missed))) LIGHT-MIN LIGHT-MAX))
+             (w (world w embers: (car r)
+                         caught: (+ (world-caught w) caught)
+                         missed: (+ (world-missed w) missed)
+                         light: target
+                         light-shown: (if (= target (world-light w)) (world-light-shown w) (light-tween w target))
+                         pop: (if (> caught 0) (tween-new 1.8 1.0 20 'out-back) (world-pop w)))))
+        (if (<= (world-left w) 0) (world w phase: 'over) w)))
+
+    ;; --- for (substratic playtest session) -----------------------------------
+
+    (define (describe w)
+      (list (cons 'phase (world-phase w))
+            (cons 'round (world-round w))
+            (cons 'seconds-left (quotient (+ (world-left w) 59) 60))
+            (cons 'moth (cons (world-moth-x w) (world-moth-y w)))
+            (cons 'light (world-light w))
+            (cons 'embers (alive-count w))
+            (cons 'caught (world-caught w))
+            (cons 'missed (world-missed w))))
+
+    (define (snapshot w)
+      (list (cons 'phase (world-phase w)) (cons 'round (world-round w)) (cons 'tick (world-tick w))
+            (cons 'rng (world-rng w)) (cons 'left (world-left w))
+            (cons 'moth (list (world-moth-x w) (world-moth-y w) (world-vx w) (world-vy w)))
+            (cons 'light (world-light w)) (cons 'caught (world-caught w)) (cons 'missed (world-missed w))
+            (cons 'embers (map (lambda (e) (list (ember-state e) (ember-x e) (ember-y e) (ember-age e) (ember-life e)))
+                               (world-embers w)))))))

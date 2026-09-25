@@ -1,0 +1,188 @@
+;;; (emberlight shell core) - What both shells share: the world on the
+;;; fixed clock, the input it reads (keys, a gamepad, the touch stick), the
+;;; best score and the settings in the store, the update line, the playtest,
+;;; and the view at its fit.
+
+(define-library (emberlight shell core)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil graphics)
+          (substratic time clock)
+          (substratic view fit)
+          (substratic view present)
+          (substratic input keys)
+          (substratic input sticks)
+          (substratic input pad)
+          (substratic store kv)
+          (substratic store settings)
+          (substratic update version)
+          (substratic update check)
+          (substratic playtest session)
+          (emberlight game world)
+          (emberlight game draw))
+
+  (export core-boot! core-frame! core-keys core-sticks core-pad core-playtest core-updater
+          core-world core-set-seen! core-settings-table core-best
+          GAME-NAME VERSION)
+
+  (begin
+    (define GAME-NAME "emberlight")
+    (define VERSION "0.1.0")
+
+    ;; The settings: the window's scale (the desktop), the palette (P).
+    (define TABLE
+      (make-settings-table
+        (list (setting id: 'scale name: "SCALE" values: (list 'x3 'x4 'x5 'x6 'x7 'x8 'fullscreen)
+                       default: 'x3 key: "scale")
+              (setting id: 'palette name: "PALETTE" values: (list 'ember 'moon) default: 'ember key: "palette"))
+        version: 1))
+
+    (define BEST-KEY "best")
+
+    (define *world* (world-new))
+    (define *clock* (clock-new))
+    (define *keys* (make-keys))
+    (define *sticks* (make-sticks))
+    (define *pad* (make-pad))
+    (define *pt* #f)
+    (define *updater* #f)
+    (define *settings* '())
+    (define *best* 0)
+    (define *rt* #f)
+    (define *presenter* #f)
+    (define *last-seen* 'unread)
+    (define *line* #f)
+    (define *line-key* 'never)
+
+    (define (core-keys) *keys*)
+    (define (core-sticks) *sticks*)
+    (define (core-pad) *pad*)
+    (define (core-playtest) *pt*)
+    (define (core-updater) *updater*)
+    (define (core-world) *world*)
+    (define (core-settings-table) TABLE)
+    (define (core-best) *best*)
+
+    (define (core-boot! build platform playtest?)
+      (set-store-app! GAME-NAME)
+      (set-store-prefix! "emberlight:")
+      (set! *settings* (settings-load TABLE))
+      (set! *best* (let ((b (store-read-datum BEST-KEY))) (if (exact-integer? b) b 0)))
+      (set! *pt* (make-playtest game: GAME-NAME build: build platform: platform
+                                describe: (lambda () (describe *world*))
+                                snapshot: (lambda () (snapshot *world*))
+                                enabled: playtest?))
+      (set! *updater* (make-updater VERSION platform)))
+
+    (define (core-set-seen! v) (store-write-datum! SEEN-KEY v))
+
+    ;; --- input ------------------------------------------------------------------
+
+    (define (axis neg pos)
+      (cond ((and (keys-held? *keys* neg) (not (keys-held? *keys* pos))) -1.0)
+            ((and (keys-held? *keys* pos) (not (keys-held? *keys* neg))) 1.0)
+            (else 0.0)))
+
+    (define (pad-dir neg pos)
+      (cond ((and (pad-held? *pad* neg) (not (pad-held? *pad* pos))) -1.0)
+            ((and (pad-held? *pad* pos) (not (pad-held? *pad* neg))) 1.0)
+            (else 0.0)))
+
+    (define (round-2 v) (/ (round (* v 100.0)) 100.0))
+    (define (clamp1 v) (max -1.0 (min 1.0 v)))
+
+    (define *start* #f)          ; a start asked for this frame (a key, a button, a touch)
+
+    ;; One tick's input: (dx dy start?). Keys, the d-pad, the left stick and
+    ;; the touch stick add up, clamped.
+    (define (current-input)
+      (let* ((st (stick-analog (car (stick-vector *sticks* "move")) (cdr (stick-vector *sticks* "move")) 0.12))
+             (ps (stick-analog (pad-axis *pad* 'lx) (pad-axis *pad* 'ly) 0.2))
+             (dx (clamp1 (+ (axis 'left 'right) (axis 'a 'd) (pad-dir 'left 'right) (car st) (car ps))))
+             (dy (clamp1 (+ (axis 'up 'down) (axis 'w 's) (pad-dir 'up 'down) (cdr st) (cdr ps)))))
+        (list (round-2 dx) (round-2 dy) *start*)))
+
+    (define (start-asked?)
+      (or (keys-pressed? *keys* 'space) (keys-pressed? *keys* 'return)
+          (pad-pressed? *pad* 'a) (pad-pressed? *pad* 'start)
+          (let ((v (stick-vector *sticks* "move"))) (> (+ (abs (car v)) (abs (cdr v))) 0.6))))
+
+    ;; --- the update line, in Emberlight's own words -------------------------------
+
+    (define (update-line)
+      (when (eq? *last-seen* 'unread) (set! *last-seen* (updater-last-seen)))
+      (let ((key (cons (updater-info *updater*) (updater-waiting? *updater*))))
+        (unless (and (pair? *line-key*) (eq? (car key) (car *line-key*)) (eq? (cdr key) (cdr *line-key*)))
+          (set! *line-key* key)
+          (let* ((status (updater-status *updater* *last-seen*))
+                 (i (updater-info *updater*))
+                 (new (case status
+                        ((waiting) (string-append "version " (if i (version-info-version i) "?") " is here: reload"))
+                        ((new-in) (string-append "new: " (version-info-summary i)))
+                        (else #f))))
+            (unless (equal? new *line*)
+              (display (string-append "emberlight: update " (symbol->string status) " " (or new "-")))
+              (newline))
+            (set! *line* new)
+            (when (or (eq? status 'new-in) (and (not *last-seen*) i))
+              (updater-mark-seen! *updater*))))
+        *line*))
+
+    ;; --- a frame ----------------------------------------------------------------------
+
+    (define (end-of-round! was now)
+      (when (and (eq? (world-phase was) 'play) (eq? (world-phase now) 'over))
+        (when (> (world-caught now) *best*)
+          (set! *best* (world-caught now))
+          (store-write-datum! BEST-KEY *best*))
+        (display (string-append "emberlight: round over " (number->string (world-caught now))
+                                " best " (number->string *best*)))
+        (newline))
+      (when (and (not (eq? (world-phase was) 'play)) (eq? (world-phase now) 'play))
+        (playtest-room-entered! *pt* (world-tick now))
+        (display (string-append "emberlight: round " (number->string (world-round now)))) (newline)))
+
+    (define (step-world! n)
+      (let loop ((i 0))
+        (when (< i n)
+          (let* ((in (current-input))
+                 (was *world*))
+            (set! *start* #f)                   ; a start is used by one tick
+            (playtest-record-input! *pt* (world-tick *world*) in)
+            (set! *world* (world-step *world* in))
+            (end-of-round! was *world*))
+          (loop (+ i 1)))))
+
+    ;; The palette, stepped with P and stored.
+    (define (palette-key!)
+      (when (keys-pressed? *keys* 'p)
+        (set! *settings* (settings-step TABLE *settings* 'palette 1))
+        (settings-save! TABLE *settings* 'palette)))
+
+    ;; dt seconds; the window's size; integer-only: the desktop window's rule.
+    (define (core-frame! dt win-w win-h integer-only)
+      (set! *clock* (clock-advance *clock* dt))
+      (if (playtest-busy? *pt*)
+          (keys-clear! *keys*)
+          (begin
+            (when (start-asked?) (set! *start* #t))
+            (palette-key!)
+            (step-world! (clock-steps *clock*))))
+      (playtest-tick! *pt* (world-tick *world*))
+      (unless *rt*
+        (set! *rt* (make-render-target VIEW-W VIEW-H 'nearest))
+        (set! *presenter* (make-presenter VIEW-W VIEW-H)))
+      (let ((f (view-fit win-w win-h VIEW-W VIEW-H integer-only: integer-only))
+            (line (update-line)))
+        (begin-frame)
+        ;; every render-target pass before the first draw to the window
+        (with-render-target *rt*
+          (draw-room! *world* *best* line (settings-value TABLE *settings* 'palette)))
+        (view-present! *presenter* *rt* f)
+        (playtest-draw! *pt* win-w win-h)
+        (end-frame))
+      (playtest-after-frame! *pt* win-w win-h)
+      (keys-end-frame! *keys*)
+      (pad-end-frame! *pad*))))

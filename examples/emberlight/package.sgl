@@ -1,0 +1,117 @@
+;;; emberlight - a tiny game made with substratic: steer a moth through a
+;;; dark room and gather the embers before they burn out. The showcase and
+;;; the integration test for the engine: the view, the window, keys, a
+;;; gamepad and the touch stick, tweens, the store, the update line and the
+;;; playtest reports (F1, F2), on the desktop and the web.
+;;;
+;;;   ../../scripts/dev sigil build                     desktop (bytecode)
+;;;   ../../scripts/dev sigil build --config release    desktop, native
+;;;   ../../scripts/dev sigil build --config web        browser (needs wasm-opt)
+;;;   node ../../tools/serve.mjs build/web 8000         serve it, with reports
+;;;
+;;; index.template.html is substratic's page template with Emberlight's title,
+;;; icons (assets/icons) and one touch stick.
+
+(import (sigil process) (sigil string) (sigil time) (sigil math) (sigil fs))
+
+(define sigil-repo "codeberg:sigil/sigil")
+
+;; The build's stamp: the commit, plus the second when the tree was dirty.
+(define (build-stamp)
+  (or (let ((s (getenv "EMBERLIGHT_STAMP")))
+        ;; spliced into JSON and HTML: letters, digits, . _ - only
+        (and s (> (string-length s) 0)
+             (let loop ((cs (string->list s)))
+               (or (null? cs)
+                   (and (let ((c (car cs))) (or (char-alphabetic? c) (char-numeric? c) (memv c (list #\. #\_ #\-))))
+                        (loop (cdr cs)))))
+             s))
+      (build-stamp-from-git)))
+
+;; A build from a tarball (no .git) says so unless the stamp is given.
+(define (build-stamp-from-git)
+  (let* ((sha (string-trim (process-output->string "git" "rev-parse" "--short=12" "HEAD")))
+         (dirty (string-trim (process-output->string "git" "status" "--porcelain" "--untracked-files=no")))
+         (sha (if (string=? sha "") "unversioned" sha)))
+    (if (string=? dirty "")
+        sha
+        (string-append sha "-dirty-" (number->string (exact (floor (current-second))))))))
+
+;; After link-web-application: the page stamped, and a version.json for the
+;; update line (Emberlight's own version, with a summary to show as "new in").
+(define (stamp-web ctx)
+  (let ((stamp (build-stamp)))   ; once: a dirty tree's stamp carries the second
+    (stamp-web* ctx stamp)))
+
+(define (stamp-web* ctx stamp)
+  (let* ((out (config-output-dir (context-config ctx)))
+         (page-path (path-join out "index.html"))
+         (page (read-file-string page-path)))
+    (write-file-string page-path
+                       (string-replace (string-replace page "__VERSION__" stamp)
+                                       "__TITLE__" "Emberlight"))
+    (write-file-string (path-join out "version.json")
+                       (string-append "{\"version\":\"0.1.0\",\"stamp\":\"" stamp
+                                      "\",\"summary\":\"The first Emberlight: one room, one moth, sixty seconds.\"}\n"))
+    (display "  web stamp ") (display stamp) (newline)
+    ctx))
+
+(package
+  name: "emberlight"
+  version: "0.1.0"
+  sigil: "0.22.7"
+  description: "A tiny game made with the substratic engine"
+  license: "BSD-3-Clause"
+  authors: (list "David Wilson <david@daviwil.com>")
+
+  entry: '(emberlight main)
+  bundle-name: "emberlight"
+
+  configs: (list
+    (config
+      name: 'dev
+      output-dir: "build/dev"
+      debug?: #t
+      optimize: 0
+      bundle?: #t)
+    (config
+      name: 'release
+      output-dir: "build/release"
+      debug?: #f
+      optimize: 2
+      backend: 'native
+      bundle?: #t)
+    (config
+      name: 'web
+      output-dir: "build/web"
+      toolchain: 'zig
+      target: "wasm32-wasi"
+      backend: 'native
+      debug?: #f
+      optimize: 2
+      bundle?: #t
+      features: '(web wasm graphics)))
+
+  dependencies: (list
+    (from-path dir: "../.." package: "substratic")
+    (from-git url: "codeberg:sigil/sigil-desktop" version: "^0.13.0" configs: '(dev release))
+    (from-git url: "codeberg:sigil/sigil-graphics" version: "^0.12.0")
+    (from-git url: sigil-repo package: "sigil-wasm-runtime" version: ">=0.22.7" configs: '(web))
+    (from-git url: sigil-repo package: "sigil-wasm-gles3" version: ">=0.22.7" configs: '(web))
+    (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
+
+  dev-dependencies: (list
+    (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
+    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Compile Emberlight (and, on the web config, link the browser app)"
+      steps: (list
+        (compile-sigil-modules sources: "src/**/*.sgl")
+        (link-assets)
+        (lambda (ctx)
+          (if (memq (target-os ctx) '(wasm wasi))
+              (stamp-web ((link-web-application name: "emberlight" html-mount-id: "status") ctx))
+              ctx))))))
