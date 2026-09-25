@@ -1,0 +1,137 @@
+;;; (substratic input sticks) - Touch sticks: their vectors, and two ways
+;;; to read one.
+;;;
+;;; The page's touch layer (web/substratic.js) sends each stick as
+;;; ("stick", "NAME,DX,DY"): the thumb's offset from where it landed, in
+;;; ring radii, dx right and dy DOWN, the length clamped to 1. A stick
+;;; state keeps the latest vector per name; a lifted thumb sends 0,0.
+;;;
+;;;   stick-sector   one of eight directions, for a platformer, tuned for
+;;;                  clinging and wall jumps (below)
+;;;   stick-analog   a vector with a radial dead zone, rescaled so the
+;;;                  edge of the dead zone reads 0 (a first-person walk or
+;;;                  look)
+;;;
+;;; The sector reader is Harkfell's (engine stick), unchanged: the left and
+;;; right sectors are the widest, so "hold toward the wall" does not slip
+;;; into a diagonal (a climb) when the thumb wobbles:
+;;;
+;;;   e, w      60 degrees each (within 30 of horizontal)
+;;;   n, s      50 degrees each (within 25 of vertical)
+;;;   diagonals 35 degrees each
+;;;
+;;; Two kinds of hysteresis keep a thumb resting on a boundary from
+;;; flickering: the sector in force is widened by 6 degrees on each side
+;;; before the others are asked, and the dead zone engages below DEAD-OUT
+;;; but lets go only below DEAD-IN. Angles are compared through tangents
+;;; (|dy| < tan(a) * |dx|), so no trigonometry runs per event and every
+;;; target computes the same answer.
+
+(define-library (substratic input sticks)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
+          (sigil string))
+
+  (export make-sticks sticks? sticks-set! sticks-clear! stick-vector stick-names
+          parse-stick-payload
+          stick-sector sector->hv stick-analog
+          DEAD-IN DEAD-OUT)
+
+  (begin
+    (define-struct sticks
+      (vectors default: '() mutable: #t))   ; ((name dx . dy) ...)
+
+    (define (make-sticks) (sticks))
+
+    (define (sticks-set! st name dx dy)
+      (set-sticks-vectors! st
+                           (cons (cons name (cons dx dy))
+                                 (filter (lambda (e) (not (equal? (car e) name))) (sticks-vectors st)))))
+
+    (define (sticks-clear! st) (set-sticks-vectors! st '()))
+
+    ;; (dx . dy), (0.0 . 0.0) for a stick never touched.
+    (define (stick-vector st name)
+      (let ((e (assoc name (sticks-vectors st))))
+        (if e (cdr e) (cons 0.0 0.0))))
+
+    (define (stick-names st) (map car (sticks-vectors st)))
+
+    ;; "NAME,DX,DY" -> (list name dx dy), or #f for anything else. The
+    ;; length is clamped to 1 here too: the page's clamp is not trusted.
+    (define (parse-stick-payload s)
+      (let ((parts (string-split s ",")))
+        (and (= (length parts) 3)
+             (> (string-length (car parts)) 0)
+             (let ((dx (string->number (cadr parts)))
+                   (dy (string->number (caddr parts))))
+               (and dx dy
+                    (let ((m (sqrt (+ (* dx dx) (* dy dy)))))
+                      (if (> m 1.0)
+                          (list (car parts) (/ dx m) (/ dy m))
+                          (list (car parts) (* 1.0 dx) (* 1.0 dy)))))))))
+
+    ;; --- the eight-way reader --------------------------------------------------
+
+    (define DEAD-IN 0.2)     ; below this the stick is at rest
+    (define DEAD-OUT 0.28)   ; from rest, this far is needed to move
+
+    ;; tan of 30, 36, 24 (the horizontal sectors' half-width: plain,
+    ;; widened, narrowed) and of 25, 31, 19 (the vertical ones').
+    (define TAN-H 0.57735)
+    (define TAN-H-WIDE 0.72654)
+    (define TAN-H-NARROW 0.44523)
+    (define TAN-V 0.46631)
+    (define TAN-V-WIDE 0.60086)
+    (define TAN-V-NARROW 0.34433)
+
+    (define (diagonal? s) (or (eq? s 'ne) (eq? s 'nw) (eq? s 'se) (eq? s 'sw)))
+    (define (horizontal? s) (or (eq? s 'e) (eq? s 'w)))
+    (define (vertical? s) (or (eq? s 'n) (eq? s 's)))
+
+    ;; The sector for (dx, dy), given the sector in force before (prev):
+    ;; 'none or one of e ne n nw w sw s se.
+    (define (stick-sector dx dy prev)
+      (let ((m2 (+ (* dx dx) (* dy dy)))
+            (dead (if (eq? prev 'none) DEAD-OUT DEAD-IN)))
+        (if (< m2 (* dead dead))
+            'none
+            (let* ((ax (abs dx))
+                   (ay (abs dy))
+                   (th (cond ((horizontal? prev) TAN-H-WIDE)
+                             ((diagonal? prev) TAN-H-NARROW)
+                             (else TAN-H)))
+                   (tv (cond ((vertical? prev) TAN-V-WIDE)
+                             ((diagonal? prev) TAN-V-NARROW)
+                             (else TAN-V))))
+              (cond ((< ay (* th ax)) (if (> dx 0) 'e 'w))
+                    ((< ax (* tv ay)) (if (> dy 0) 's 'n))
+                    ((> dx 0) (if (> dy 0) 'se 'ne))
+                    (else (if (> dy 0) 'sw 'nw)))))))
+
+    ;; A sector as (h . v), -1, 0 or 1 in each; v is screen-down positive.
+    (define (sector->hv s)
+      (case s
+        ((e) (cons 1 0))
+        ((ne) (cons 1 -1))
+        ((n) (cons 0 -1))
+        ((nw) (cons -1 -1))
+        ((w) (cons -1 0))
+        ((sw) (cons -1 1))
+        ((s) (cons 0 1))
+        ((se) (cons 1 1))
+        (else (cons 0 0))))
+
+    ;; --- the analogue reader ---------------------------------------------------
+
+    ;; (dx . dy) with a radial dead zone of `dead` ring radii: inside it,
+    ;; (0.0 . 0.0); outside, the same direction with the length rescaled
+    ;; from dead..1 to 0..1, so a push starts from zero rather than jumping
+    ;; to `dead`.
+    (define (stick-analog dx dy dead)
+      (let ((m (sqrt (+ (* dx dx) (* dy dy)))))
+        (if (or (<= m dead) (<= m 0.0))
+            (cons 0.0 0.0)
+            (let ((k (/ (min 1.0 (/ (- m dead) (- 1.0 dead))) m)))
+              (cons (* dx k) (* dy k))))))))

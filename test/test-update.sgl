@@ -1,11 +1,12 @@
-;;; (substratic update): version.json parsing, the version comparison, and
+;;; (substratic update version, check): version.json parsing, the version comparison, and
 ;;; the status on each platform, including the once-per-version line
 ;;; through the store.
 
 (import (sigil test)
         (sigil time)
-        (substratic store)
-        (substratic update))
+        (substratic store kv)
+        (substratic update version)
+        (substratic update check))
 
 (define FULL "{\"version\":\"0.1.2\",\"date\":\"2026-09-25\",\"stamp\":\"a1b2c3d4e5f6\",\"summary\":\"Moths at the start.\",\"news\":\"https://example.org/news/0-1-2/\"}")
 

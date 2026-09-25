@@ -1,0 +1,83 @@
+;;; (substratic time tween) - Values that change over time, on the fixed
+;;; clock.
+;;;
+;;; A tween runs from one number to another over a whole number of sim
+;;; ticks with an easing. It advances by the ticks the clock drained in a
+;;; frame (tween-after-frame) and by nothing else, so its state after N
+;;; ticks is the same whatever the frame rate delivered them;
+;;; test/test-tween.sgl asserts it at two rates. The clock's alpha only
+;;; interpolates the drawn value between ticks.
+;;;
+;;; Extracted from Crash The Stack's (crash tween); the code is unchanged.
+
+(define-library (substratic time tween)
+  (import (sigil struct)
+          (sigil math)
+          (substratic time clock))
+
+  (export tween tween? tween-new
+          tween-from tween-to tween-ticks tween-at tween-ease
+          tween-tick tween-advance tween-after-frame
+          tween-value tween-progress tween-done?
+          ease)
+
+  (begin
+    ;; --- easing --------------------------------------------------------------
+
+    ;; p in 0..1 -> 0..1. out-back overshoots past 1 on the way in, for
+    ;; things that should land with a little bounce.
+    (define (ease name p)
+      (case name
+        ((out-quad) (- 1.0 (square (- 1.0 p))))
+        ((in-out-quad) (if (< p 0.5)
+                           (* 2.0 p p)
+                           (- 1.0 (/ (square (- 2.0 (* 2.0 p))) 2.0))))
+        ((out-back) (let ((c1 1.70158)
+                          (q (- p 1.0)))
+                      (+ 1.0
+                         (* (+ c1 1.0) q q q)
+                         (* c1 q q))))
+        (else p)))
+
+    ;; --- tweens ---------------------------------------------------------------
+
+    ;; from, to: numbers. ticks: duration in sim ticks (at least 1). at: ticks
+    ;; elapsed. ease: a name ease understands.
+    (define-struct tween
+      (from default: 0.0)
+      (to default: 1.0)
+      (ticks default: 1)
+      (at default: 0)
+      (ease default: 'linear))
+
+    (define (tween-new from to ticks ease-name)
+      (tween from: from
+             to: to
+             ticks: (max 1 ticks)
+             ease: ease-name))
+
+    (define (tween-advance t n)
+      (tween t at: (min (tween-ticks t) (+ (tween-at t) n))))
+
+    (define (tween-tick t)
+      (tween-advance t 1))
+
+    ;; The tween after a frame: it moves by the ticks the clock drained and
+    ;; by nothing else. Every effect goes through here (and so does the
+    ;; gate), which is what keeps the frame rate out of the animation.
+    (define (tween-after-frame t c)
+      (tween-advance t (clock-steps c)))
+
+    (define (tween-done? t)
+      (>= (tween-at t) (tween-ticks t)))
+
+    ;; Eased progress in 0..1 at (at + alpha) ticks; alpha is the clock's
+    ;; fraction of a tick, 0 for the exact tick value.
+    (define (tween-progress t alpha)
+      (let ((p (/ (+ (tween-at t) alpha) (tween-ticks t))))
+        (ease (tween-ease t) (min 1.0 (max 0.0 p)))))
+
+    (define (tween-value t alpha)
+      (+ (tween-from t)
+         (* (- (tween-to t) (tween-from t))
+            (tween-progress t alpha))))))

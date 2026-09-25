@@ -1,4 +1,4 @@
-;;; (substratic png): the checksums against published values, the file's
+;;; (substratic image png): the checksums against published values, the file's
 ;;; structure, and a decoder (stb_image, through sigil-graphics) reading
 ;;; back what was written. stb_image does not check CRCs, so the CRC is
 ;;; held to its published test vector instead.
@@ -8,7 +8,7 @@
         (sigil fs)
         (sigil time)
         (sigil graphics image)
-        (substratic png))
+        (substratic image png))
 
 (define (ascii-bv s)
   (let* ((n (string-length s)) (bv (make-bytevector n 0)))

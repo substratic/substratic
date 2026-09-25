@@ -1,0 +1,84 @@
+;;; (substratic time clock) - A fixed clock: render frames into whole ticks.
+;;;
+;;; Animations and simulations have to look the same at 30 frames a second
+;;; on a phone and at 144 on a desktop. So time is counted in SIM TICKS of
+;;; 1/60 s (Gaffer's "Fix Your Timestep"): the clock turns each render
+;;; frame's wall dt into a whole number of ticks and keeps the remainder
+;;; for the next frame. Whatever advances with the game advances by that
+;;; number of ticks and nothing else, and the remainder (alpha, a fraction
+;;; of one tick) only interpolates what is drawn.
+;;;
+;;; A frame that arrives very late (the tab was hidden, the machine
+;;; stalled) would otherwise owe hundreds of ticks; after
+;;; MAX-STEPS-PER-FRAME the clock drops the rest and says how much it
+;;; dropped, so a hiccup costs one visible skip rather than a catch-up
+;;; spiral.
+;;;
+;;; Immutable and copy-constructed; nothing reads a platform. The shells
+;;; feed it: wait-frame's dt natively, the difference between
+;;; requestAnimationFrame timestamps on the web.
+;;;
+;;; Extracted from Crash The Stack's (crash tween), which held the clock
+;;; and the tweens in one module; the code is unchanged.
+
+(define-library (substratic time clock)
+  (import (sigil struct)
+          (sigil math))
+
+  (export TICKS-PER-SECOND SIM-STEP MAX-STEPS-PER-FRAME
+          seconds->ticks
+          clock clock? clock-new
+          clock-acc clock-ticks clock-steps clock-dropped clock-alpha clock-dt
+          clock-advance)
+
+  (begin
+    (define TICKS-PER-SECOND 60)
+    (define SIM-STEP (/ 1.0 TICKS-PER-SECOND))
+    ;; Cap on catch-up ticks in one frame: about 100 ms of animation.
+    (define MAX-STEPS-PER-FRAME 6)
+
+    (define (seconds->ticks s)
+      (max 1 (exact (round (* s TICKS-PER-SECOND)))))
+
+    ;; --- the clock -----------------------------------------------------------
+
+    ;; acc: wall seconds not yet turned into ticks (always below SIM-STEP
+    ;; after an advance). ticks: every tick ever run. steps: the ticks the
+    ;; last advance produced, which is what the frame's tweens advance by.
+    ;; dropped: seconds discarded at the cap, cumulative. alpha: acc as a
+    ;; fraction of a tick, for interpolating a drawn value between ticks.
+    ;; dt: the last frame's wall dt as given, kept for the record.
+    (define-struct clock
+      (acc default: 0.0)
+      (ticks default: 0)
+      (steps default: 0)
+      (dropped default: 0.0)
+      (alpha default: 0.0)
+      (dt default: 0.0))
+
+    (define (clock-new) (clock))
+
+    ;; One render frame of dt seconds: the clock after draining as many
+    ;; whole ticks as the accumulated time covers, up to the cap. A
+    ;; negative dt (a clock that went backwards) counts as zero.
+    (define (clock-advance c dt)
+      (let ((dt (max 0.0 dt)))
+        (let loop ((acc (+ (clock-acc c) dt))
+                   (steps 0))
+          (cond ((>= steps MAX-STEPS-PER-FRAME)
+                 (clock c
+                        acc: 0.0
+                        ticks: (+ (clock-ticks c) steps)
+                        steps: steps
+                        dropped: (+ (clock-dropped c) acc)
+                        alpha: 0.0
+                        dt: dt))
+                ((>= acc SIM-STEP)
+                 (loop (- acc SIM-STEP) (+ steps 1)))
+                (else
+                 (clock c
+                        acc: acc
+                        ticks: (+ (clock-ticks c) steps)
+                        steps: steps
+                        alpha: (/ acc SIM-STEP)
+                        dt: dt))))))))

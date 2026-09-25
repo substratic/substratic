@@ -1,0 +1,495 @@
+;;; (substratic playtest session) - Where am I, and what went wrong here: F1 and F2.
+;;;
+;;; A tester who finds something wrong presses F2 and types one line. The
+;;; game already knows everything else, so the report carries it:
+;;;
+;;;   F1  a readout at the top of the screen: the build, the tick, and the
+;;;       game's own description of where the player is (region and room,
+;;;       cell and position, carried items: whatever the game names).
+;;;   F2  a report: the frame as a screenshot, report.json (the readout,
+;;;       a snapshot of the game's state, and for a deterministic game the
+;;;       input log since the room was entered), and a one-line note typed
+;;;       in the game.
+;;;
+;;; The game supplies two procedures:
+;;;
+;;;   describe  (lambda () ALIST)  where the player is, e.g.
+;;;             '((region . "hollow") (room . "x3y2") (cell 4 . 7)
+;;;               (position 123.5 . 88.0) (items "h2" "h3"))
+;;;             Every entry is shown and reported; the keys are the game's.
+;;;   snapshot  (lambda () DATUM)  the state worth keeping (the game's save
+;;;             datum is usually right). Reported as JSON and as the
+;;;             written datum, which reads back exactly.
+;;;
+;;; and calls, each frame:
+;;;
+;;;   (playtest-frame! p)               natively: polls F1, F2 and the note's keys
+;;;   (playtest-tick! p tick)           the game's tick count, for the readout
+;;;   (playtest-draw! p win-w win-h)    inside the frame, after the game's drawing
+;;;   (playtest-after-frame! p w h)     after end-frame, with the framebuffer size
+;;;
+;;; and, for the input log, (playtest-room-entered! p tick) on entering a
+;;; room and (playtest-record-input! p tick input) each tick (only changes
+;;; are kept). While (playtest-busy? p) a report is being made: the game
+;;; pauses and ignores its keys.
+;;;
+;;; ON THE DESKTOP the note is a small text field drawn in the game (5x7
+;;; bitmap letters, one case; typed with the keyboard's US layout, since
+;;; the window reports keys, not characters). Enter saves, Escape
+;;; discards. The report goes to <store-root>/reports/<local time>/:
+;;; report.json and screenshot.png, where <store-root> is (substratic
+;;; store)'s: ~/.local/share/<game>/reports/... on Linux.
+;;;
+;;; ON THE WEB the page does the parts a browser does better
+;;; (web/substratic.js): at F2 (or its report button, for phones) the game
+;;; prints one console line, "substratic: playtest capture JSON"; in the
+;;; same task, before the browser composites, the page takes the canvas as
+;;; a PNG, opens an HTML text field over the canvas (so a phone brings up
+;;; its keyboard), and POSTs the report, the note and the PNG to the dev
+;;; server (tools/serve.mjs), which writes the same two files. The page
+;;; tells the game ("playtest", "saved DIR"), ("playtest", "failed WHY") or
+;;; ("playtest", "cancel").
+;;;
+;;; Dev-only by default: a playtest starts disabled. The game enables it
+;;; from a flag (--playtest, ?playtest) or its dev build. Disabled, every
+;;; call here is a no-op and F1 and F2 reach the game.
+
+(define-library (substratic playtest session)
+  (cond-expand
+    (wasm (import (sigil struct)
+                  (sigil math)
+                  (sigil list)
+                  (sigil string)
+                  (sigil time)
+                  (sigil json)
+                  (sigil graphics)
+                  (substratic text font)
+                  (substratic playtest json)
+                  (substratic store kv)))
+    (else (import (sigil struct)
+                  (sigil math)
+                  (sigil list)
+                  (sigil string)
+                  (sigil time)
+                  (sigil io)
+                  (sigil fs)
+                  (sigil json)
+                  (sigil graphics)
+                  (sigil desktop)
+                  (substratic text font)
+                  (substratic playtest json)
+                  (substratic store kv)
+                  (substratic image png)
+                  (substratic image capture))))
+
+  (export make-playtest playtest?
+          playtest-enabled? playtest-set-enabled! playtest-readout? playtest-set-readout!
+          playtest-busy? playtest-phase playtest-note playtest-message playtest-last-dir
+          playtest-tick! playtest-room-entered! playtest-record-input! playtest-input-log
+          playtest-frame! playtest-key! playtest-type! playtest-dispatch!
+          playtest-capture! playtest-after-frame! playtest-save! playtest-cancel!
+          playtest-set-capturer! playtest-draw!
+          playtest-readout-lines playtest-report playtest-report-json
+          format-value report-stamp
+          CAPTURE-PREFIX NOTE-MAX)
+
+  (begin
+    (define CAPTURE-PREFIX "substratic: playtest capture ")
+    (define NOTE-MAX 200)
+    (define MESSAGE-FRAMES 240)          ; how long "report saved" stays up
+
+    (define-struct playtest
+      (game default: "game")
+      (build default: "")
+      (platform default: 'desktop)       ; 'desktop or 'web
+      (describe default: #f)
+      (snapshot default: #f)
+      (enabled default: #f mutable: #t)
+      (readout default: #f mutable: #t)
+      (tick default: 0 mutable: #t)
+      (room-tick default: #f mutable: #t)
+      (log default: '() mutable: #t)       ; ((tick . input) ...), newest first
+      (last-input default: #f mutable: #t)
+      (phase default: 'idle mutable: #t)   ; idle, pending, note (desktop), page (web)
+      (taken default: #f mutable: #t)      ; the report's alist, taken at F2
+      (pixels default: #f mutable: #t)     ; (w h rgba-top-first) or #f
+      (note default: "" mutable: #t)
+      (message default: #f mutable: #t)
+      (message-left default: 0 mutable: #t)
+      (last-dir default: #f mutable: #t)
+      (held-frames default: 0 mutable: #t) ; backspace held, for its repeat
+      (capturer default: #f mutable: #t))  ; (lambda (w h) rgba-or-#f): tests, offscreen games
+
+    ;; game: the name (the report's). build: the build stamp. platform:
+    ;; 'desktop or 'web.
+    (define (make-playtest (keys: (game "game") (build "") (platform 'desktop)
+                                  (describe (lambda () '())) (snapshot (lambda () #f))
+                                  (enabled #f)))
+      (playtest game: game build: build platform: platform
+                describe: describe snapshot: snapshot enabled: enabled))
+
+    (define (playtest-enabled? p) (playtest-enabled p))
+    (define (playtest-set-enabled! p on) (set-playtest-enabled! p (and on #t)))
+    (define (playtest-readout? p) (and (playtest-enabled p) (playtest-readout p)))
+    (define (playtest-set-readout! p on) (set-playtest-readout! p (and on #t)))
+    (define (playtest-busy? p) (and (playtest-enabled p) (not (eq? (playtest-phase p) 'idle))))
+    (define (playtest-set-capturer! p f) (set-playtest-capturer! p f))
+    (define (playtest-input-log p) (reverse (playtest-log p)))
+
+    (define (say! p text)
+      (set-playtest-message! p text)
+      (set-playtest-message-left! p MESSAGE-FRAMES))
+
+    ;; --- the tick and the input log --------------------------------------------
+
+    (define (playtest-tick! p tick) (set-playtest-tick! p tick))
+
+    (define (playtest-room-entered! p tick)
+      (set-playtest-room-tick! p tick)
+      (set-playtest-log! p '())
+      (set-playtest-last-input! p #f))
+
+    ;; input: any datum describing the tick's input (the held keys, a
+    ;; stick's sector). Kept only when it differs from the last one kept.
+    (define (playtest-record-input! p tick input)
+      (unless (and (pair? (playtest-log p)) (equal? input (playtest-last-input p)))
+        (set-playtest-log! p (cons (cons tick input) (playtest-log p)))
+        (set-playtest-last-input! p input)))
+
+    ;; --- values as text ----------------------------------------------------------
+
+    (define (round-1 x)
+      (let ((r (/ (round (* x 10.0)) 10.0)))
+        (if (= r (round r)) (number->string (exact (round r))) (number->string r))))
+
+    (define (written d) (with-output-to-string (lambda () (write d))))
+
+    (define (atom->string v)
+      (cond ((string? v) v)
+            ((symbol? v) (symbol->string v))
+            ((and (number? v) (exact? v)) (number->string v))
+            ((number? v) (round-1 v))
+            ((eq? v #t) "yes")
+            ((eq? v #f) "no")
+            ((char? v) (string v))
+            (else (written v))))
+
+    ;; A readout value: (4 . 7) -> "4,7"; (a b c) -> "a b c"; '() -> "-".
+    (define (format-value v)
+      (cond ((null? v) "-")
+            ((and (pair? v) (not (list? v)))
+             (string-append (format-value (car v)) "," (format-value (cdr v))))
+            ((list? v) (string-join (map format-value v) " "))
+            ((vector? v) (format-value (vector->list v)))
+            (else (atom->string v))))
+
+    (define (condition->text e)
+      (if (error-object? e) (error-object-message e) (atom->string e)))
+
+    ;; The game's description, never raising: an error is itself described.
+    (define (describe-safely p)
+      (let ((d (guard (e (#t (list (cons 'describe-error (condition->text e)))))
+                 ((playtest-describe p)))))
+        (if (list? d) (filter pair? d) '())))
+
+    (define (snapshot-safely p)
+      (guard (e (#t (list 'snapshot-error (condition->text e))))
+        ((playtest-snapshot p))))
+
+    (define (clip s cols)
+      (if (> (string-length s) cols) (substring s 0 (max 0 cols)) s))
+
+    ;; Parts joined two spaces apart into lines of at most cols characters;
+    ;; a part is never split unless it alone is too long.
+    (define (pack parts cols)
+      (let loop ((ps parts) (line "") (out '()))
+        (cond ((null? ps) (reverse (if (string=? line "") out (cons line out))))
+              ((string=? line "") (loop (cdr ps) (clip (car ps) cols) out))
+              ((<= (+ (string-length line) 2 (string-length (car ps))) cols)
+               (loop (cdr ps) (string-append line "  " (car ps)) out))
+              (else (loop ps "" (cons line out))))))
+
+    ;; The readout as lines of at most cols characters: the game, the build
+    ;; and the tick, then the game's description.
+    (define (playtest-readout-lines p cols)
+      (let ((head (string-append (playtest-game p) " " (playtest-build p)
+                                 "  tick " (number->string (playtest-tick p))
+                                 (if (playtest-room-tick p)
+                                     (string-append " (room +" (number->string (- (playtest-tick p) (playtest-room-tick p))) ")")
+                                     "")))
+            (parts (map (lambda (e) (string-append (atom->string (car e)) " " (format-value (cdr e))))
+                        (describe-safely p))))
+        (cons (clip head cols) (pack parts cols))))
+
+    ;; --- the report ------------------------------------------------------------------
+
+    (define (two n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))
+
+    ;; Local time as "20260925-151106", a report directory's name.
+    (define (report-stamp)
+      (guard (e (#t (number->string (exact (floor (current-second))))))
+        (let ((t (time->list (current-second))))
+          (string-append (number->string (list-ref t 5)) (two (list-ref t 4)) (two (list-ref t 3))
+                         "-" (two (list-ref t 2)) (two (list-ref t 1)) (two (list-ref t 0))))))
+
+    ;; The report at this moment, before the note: an alist datum->json writes.
+    (define (take-report p)
+      (let ((snap (snapshot-safely p)))
+        (append
+          (list (cons 'game (playtest-game p))
+                (cons 'build (playtest-build p))
+                (cons 'platform (playtest-platform p))
+                (cons 'time (report-stamp))
+                (cons 'tick (playtest-tick p))
+                (cons 'location (describe-safely p))
+                (cons 'state snap)
+                (cons 'state-sexp (written snap)))
+          (if (playtest-room-tick p)
+              (list (cons 'input
+                          (list (cons 'room-entered-tick (playtest-room-tick p))
+                                (cons 'log (map (lambda (e) (list (car e) (cdr e)))
+                                                (playtest-input-log p))))))
+              '()))))
+
+    ;; The report with the note and the screenshot's file name (or #f).
+    (define (playtest-report p note screenshot)
+      (append (or (playtest-taken p) (take-report p))
+              (list (cons 'note note)
+                    (cons 'screenshot (or screenshot 'null)))))
+
+    (define (playtest-report-json p note screenshot)
+      (datum->json (playtest-report p note screenshot)))
+
+    ;; --- making a report -------------------------------------------------------
+
+    ;; F2: take the report now; the screenshot follows at the end of the frame.
+    (define (playtest-capture! p)
+      (when (and (playtest-enabled p) (eq? (playtest-phase p) 'idle))
+        (set-playtest-taken! p (take-report p))
+        (set-playtest-pixels! p #f)
+        (set-playtest-note! p "")
+        (set-playtest-phase! p 'pending)))
+
+    (define (read-pixels p w h)
+      (cond ((playtest-capturer p) ((playtest-capturer p) w h))
+            (else (native-capture w h))))
+
+    (cond-expand
+      (wasm (define (native-capture w h) #f))
+      (else (define (native-capture w h) (capture-frame w h))))
+
+    ;; After the frame's end-frame, with the framebuffer's size. Desktop:
+    ;; the pixels, then the note field. Web: the capture line for the page.
+    (define (playtest-after-frame! p w h)
+      (when (> (playtest-message-left p) 0)
+        (set-playtest-message-left! p (- (playtest-message-left p) 1))
+        (when (= (playtest-message-left p) 0) (set-playtest-message! p #f)))
+      (when (and (playtest-enabled p) (eq? (playtest-phase p) 'pending))
+        (if (eq? (playtest-platform p) 'web)
+            (begin
+              (display (string-append CAPTURE-PREFIX (datum->json (playtest-taken p))))
+              (newline)
+              (set-playtest-phase! p 'page))
+            (let ((px (guard (e (#t #f)) (read-pixels p w h))))
+              (set-playtest-pixels! p (and px (list w h px)))
+              (set-playtest-phase! p 'note)))))
+
+    (define (clear! p)
+      (set-playtest-phase! p 'idle)
+      (set-playtest-taken! p #f)
+      (set-playtest-pixels! p #f)
+      (set-playtest-note! p ""))
+
+    (define (playtest-cancel! p)
+      (clear! p)
+      (say! p "report discarded"))
+
+    ;; Desktop: write the report under <store-root>/reports/<stamp>/.
+    ;; Answers the directory, or #f (and says why).
+    (cond-expand
+      (wasm
+       (define (write-report! p) #f))
+      (else
+       (define (free-dir base)
+         (let loop ((n 1))
+           (let ((d (if (= n 1) base (string-append base "-" (number->string n)))))
+             (if (file-exists? d) (loop (+ n 1)) d))))
+       (define (write-report! p)
+         (guard (e (#t (say! p (string-append "report NOT saved: " (condition->text e))) #f))
+           (let* ((dir (free-dir (string-append (store-root) "/reports/" (report-stamp))))
+                  (px (playtest-pixels p))
+                  (shot (and px "screenshot.png")))
+             (ensure-directory dir)
+             (when px
+               (write-file-bytes (string-append dir "/screenshot.png")
+                                 (rgba->png (car px) (cadr px) (caddr px))))
+             (write-file-bytes (string-append dir "/report.json")
+                               (string->utf8 (playtest-report-json p (playtest-note p) shot)))
+             dir)))))
+
+    (define (playtest-save! p)
+      (when (eq? (playtest-phase p) 'note)
+        (let ((dir (write-report! p)))
+          (clear! p)
+          (when dir
+            (set-playtest-last-dir! p dir)
+            (say! p (string-append "report saved " dir))
+            (display (string-append "substratic: playtest report " dir))
+            (newline))
+          dir)))
+
+    ;; --- keys ---------------------------------------------------------------------
+
+    ;; A key the game's shell saw, as sigil-desktop names it. #t when the
+    ;; playtest took it (the game should then ignore it). F1 and F2 while
+    ;; idle; every key while a note is open.
+    (define (playtest-key! p k)
+      (cond ((not (playtest-enabled p)) #f)
+            ((eq? (playtest-phase p) 'note)
+             (case k
+               ((return kp-enter) (playtest-save! p))
+               ((escape) (playtest-cancel! p))
+               ((backspace) (backspace! p)))
+             #t)
+            ((not (eq? (playtest-phase p) 'idle)) #t)
+            ((eq? k 'f1) (set-playtest-readout! p (not (playtest-readout p))) #t)
+            ((eq? k 'f2) (playtest-capture! p) #t)
+            (else #f)))
+
+    ;; A typed character into the open note.
+    (define (playtest-type! p c)
+      (when (and (eq? (playtest-phase p) 'note)
+                 (< (string-length (playtest-note p)) NOTE-MAX)
+                 (char? c) (>= (char->integer c) 32))
+        (set-playtest-note! p (string-append (playtest-note p) (string c)))))
+
+    (define (backspace! p)
+      (let ((n (string-length (playtest-note p))))
+        (when (> n 0) (set-playtest-note! p (substring (playtest-note p) 0 (- n 1))))))
+
+    ;; The web's events. #t when taken.
+    ;;   ("keydown" | "keyup", "F1" | "F2")
+    ;;   ("playtest", "readout" | "capture" | "cancel" | "saved DIR" | "failed WHY")
+    (define (playtest-dispatch! p type payload)
+      (cond ((not (playtest-enabled p)) #f)
+            ((string=? type "keydown")
+             (cond ((string=? payload "F1") (playtest-key! p 'f1))
+                   ((string=? payload "F2") (playtest-key! p 'f2))
+                   (else (playtest-busy? p))))
+            ((string=? type "keyup")
+             (or (string=? payload "F1") (string=? payload "F2") (playtest-busy? p)))
+            ((string=? type "playtest")
+             (cond ((string=? payload "readout") (set-playtest-readout! p (not (playtest-readout p))))
+                   ((string=? payload "capture") (playtest-capture! p))
+                   ((string=? payload "cancel") (playtest-cancel! p))
+                   ((string-starts-with? payload "saved ")
+                    (clear! p)
+                    (set-playtest-last-dir! p (substring payload 6 (string-length payload)))
+                    (say! p (string-append "report saved " (playtest-last-dir p))))
+                   ((string-starts-with? payload "failed ")
+                    (clear! p)
+                    (say! p (string-append "report NOT saved: " (substring payload 7 (string-length payload))))))
+             #t)
+            (else #f)))
+
+    ;; Desktop: poll sigil-desktop for F1, F2 and, while a note is open,
+    ;; the typing. On the web the page's events come through
+    ;; playtest-dispatch! instead.
+    (cond-expand
+      (wasm
+       (define (playtest-frame! p) #f))
+      (else
+       (define LETTERS (string->list "abcdefghijklmnopqrstuvwxyz"))
+       (define DIGITS (string->list "0123456789"))
+       (define SHIFTED-DIGITS (string->list ")!@#$%^&*("))
+       ;; (key plain shifted)
+       (define MARKS
+         (list (list 'space #\space #\space) (list 'comma #\, #\<) (list 'period #\. #\>)
+               (list 'slash #\/ #\?) (list 'semicolon #\; #\:) (list 'apostrophe #\' #\")
+               (list 'minus #\- #\_) (list 'equal #\= #\+) (list 'left-bracket #\[ #\{)
+               (list 'right-bracket #\] #\}) (list 'grave #\` #\~)))
+       (define REPEAT-AFTER 24)          ; frames before a held backspace repeats
+       (define REPEAT-EVERY 3)
+
+       (define (shift?) (or (key-down? 'shift) (key-down? 'right-shift)))
+
+       (define (poll-typing! p)
+         (let ((up (shift?)))
+           (for-each (lambda (c)
+                       (when (key-pressed? (string->symbol (string c)))
+                         (playtest-type! p (if up (char-upcase c) c))))
+                     LETTERS)
+           (let loop ((ds DIGITS) (ss SHIFTED-DIGITS))
+             (unless (null? ds)
+               (when (key-pressed? (string->symbol (string (car ds))))
+                 (playtest-type! p (if up (car ss) (car ds))))
+               (loop (cdr ds) (cdr ss))))
+           (for-each (lambda (m)
+                       (when (key-pressed? (car m))
+                         (playtest-type! p (if up (caddr m) (cadr m)))))
+                     MARKS)
+           (if (key-down? 'backspace)
+               (let ((n (+ (playtest-held-frames p) 1)))
+                 (set-playtest-held-frames! p n)
+                 (when (or (= n 1) (and (> n REPEAT-AFTER) (= 0 (modulo n REPEAT-EVERY))))
+                   (backspace! p)))
+               (set-playtest-held-frames! p 0))))
+
+       (define (playtest-frame! p)
+         (when (playtest-enabled p)
+           (cond ((eq? (playtest-phase p) 'note)
+                  (cond ((or (key-pressed? 'return) (key-pressed? 'kp-enter)) (playtest-save! p))
+                        ((key-pressed? 'escape) (playtest-cancel! p))
+                        (else (poll-typing! p))))
+                 ((eq? (playtest-phase p) 'idle)
+                  (when (key-pressed? 'f1) (playtest-key! p 'f1))
+                  (when (key-pressed? 'f2) (playtest-key! p 'f2))))))))
+
+    ;; --- drawing -----------------------------------------------------------------
+
+    ;; Glyph cells per window pixel: 1 up to 800 px wide, 2 to 1600, and so on.
+    (define (text-scale win-w) (max 1 (min 4 (+ 1 (quotient (max 0 (- win-w 1)) 800)))))
+
+    (define (panel! x y w h)
+      (set-color 0.0 0.0 0.0 0.72)
+      (draw-filled-rect x y w h))
+
+    (define (lines! lines x y s)
+      (let loop ((ls lines) (y y))
+        (unless (null? ls)
+          (draw-text (car ls) x y s)
+          (loop (cdr ls) (+ y (* s (+ GLYPH-H 3)))))))
+
+    ;; The readout, the note field and the last message, over the game's
+    ;; frame (in window pixels, inside the caller's begin-frame/end-frame).
+    (define (playtest-draw! p win-w win-h)
+      (when (playtest-enabled p)
+        (let* ((s (text-scale win-w))
+               (pad (* 2 s))
+               (line-h (* s (+ GLYPH-H 3)))
+               (cols (max 8 (quotient (- win-w (* 2 pad)) (* s (+ GLYPH-W 1))))))
+          (set-blend-mode 'normal)
+          (when (playtest-readout p)
+            (let ((ls (playtest-readout-lines p cols)))
+              (panel! 0 0 win-w (+ (* 2 pad) (* line-h (length ls))))
+              (set-color 0.85 1.0 0.85 1.0)
+              (lines! ls pad (+ pad s) s)))
+          (when (eq? (playtest-phase p) 'note)
+            (let* ((head (if (playtest-pixels p) "report: type a note" "report (no screenshot): type a note"))
+                   (field (string-append "> " (playtest-note p) "_"))
+                   (shown (if (> (string-length field) cols)
+                              (substring field (- (string-length field) cols) (string-length field))
+                              field))
+                   (ls (list head shown "enter saves   esc discards"))
+                   (h (+ (* 2 pad) (* line-h (length ls))))
+                   (y (- win-h h (* 4 s))))
+              (panel! 0 y win-w h)
+              (set-color 1.0 0.9 0.5 1.0)
+              (lines! ls pad (+ y pad s) s)))
+          (when (playtest-message p)
+            (let* ((ls (pack (list (playtest-message p)) cols))
+                   (h (+ (* 2 pad) (* line-h (length ls))))
+                   (y (- win-h h)))
+              (panel! 0 y win-w h)
+              (set-color 0.85 0.95 1.0 1.0)
+              (lines! ls pad (+ y pad s) s))))))))

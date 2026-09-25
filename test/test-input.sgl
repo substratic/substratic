@@ -1,10 +1,12 @@
-;;; (substratic input): the key state, DOM names, the stick payloads, and
+;;; (substratic input keys, sticks, events): the key state, DOM names, the stick payloads, and
 ;;; the two stick readers. The sector tests are Harkfell's (engine stick)
 ;;; tests, unchanged. Offsets are in ring radii, dy down.
 
 (import (sigil test)
         (sigil math)
-        (substratic input))
+        (substratic input keys)
+        (substratic input sticks)
+        (substratic input events))
 
 (test-group "keys: held, pressed, released"
   (test "a press is held and pressed until the frame ends; then only held"

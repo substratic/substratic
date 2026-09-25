@@ -1,4 +1,4 @@
-;;; (substratic settings) - A game's settings: rows, the values in force,
+;;; (substratic store settings) - A game's settings: rows, the values in force,
 ;;; and where they live.
 ;;;
 ;;; The game declares its rows as a table: each row has an id, a name, the
@@ -10,7 +10,7 @@
 ;;;
 ;;; The settings in force are an alist of (id . value). The verbs on it
 ;;; (settings-value, settings-with, settings-step) are pure; settings-load
-;;; and settings-save! go through (substratic store).
+;;; and settings-save! go through (substratic store kv).
 ;;;
 ;;; SCHEMA VERSION. The table carries a version. A store without it, or at
 ;;; another one, loses its setting keys (the rows' and the table's retired
@@ -23,9 +23,9 @@
 ;;; in the module and its load and save in its shell; here both are the
 ;;; table's.
 
-(define-library (substratic settings)
+(define-library (substratic store settings)
   (import (sigil struct)
-          (substratic store))
+          (substratic store kv))
 
   (export setting setting? setting-id setting-name setting-values setting-default setting-key
           settings-table settings-table? settings-table-rows settings-table-version

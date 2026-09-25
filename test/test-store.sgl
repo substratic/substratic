@@ -1,4 +1,4 @@
-;;; (substratic store), native half: the data directory chain, and datums
+;;; (substratic store kv), native half: the data directory chain, and datums
 ;;; through files under a scratch root. The web half (localStorage) runs in
 ;;; the wasm test page (test/web).
 
@@ -6,7 +6,7 @@
         (sigil fs)
         (sigil process)
         (sigil time)
-        (substratic store))
+        (substratic store kv))
 
 (define saved
   (map (lambda (name) (cons name (getenv name)))

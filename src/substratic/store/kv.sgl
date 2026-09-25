@@ -1,4 +1,4 @@
-;;; (substratic store) - Where a save lives on each target.
+;;; (substratic store kv) - Where a save lives on each target.
 ;;;
 ;;; Extracted from Crash The Stack's (crash store), by way of Harkfell's
 ;;; copy, which added set-store-app! so the module names no game.
@@ -16,7 +16,7 @@
 ;;; one datum is #f. Each verb is one define per target, inside the
 ;;; cond-expand.
 
-(define-library (substratic store)
+(define-library (substratic store kv)
   (cond-expand
     (wasm (import (sigil io)
                   (sigil browser local-storage)))

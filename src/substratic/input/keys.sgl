@@ -1,0 +1,97 @@
+;;; (substratic input keys) - The keys down, pressed and released, the same
+;;; on both targets.
+;;;
+;;; A key state holds the keys down now, and the keys pressed and released
+;;; since the last keys-end-frame!. The shells feed it events: natively
+;;; from sigil-desktop's key-pressed? / key-released? polls (keys-poll!,
+;;; given the keys the game listens to), on the web from the loader's
+;;; keydown / keyup (through (substratic input events)), whose DOM names
+;;; dom-key->symbol turns into sigil-desktop's names ('left, 'return, 'f1,
+;;; 'a ...), so a game reads one set of symbols whatever the target.
+
+(define-library (substratic input keys)
+  (cond-expand
+    (wasm (import (sigil struct)
+                  (sigil list)
+                  (sigil string)))
+    (else (import (sigil struct)
+                  (sigil list)
+                  (sigil string)
+                  (sigil desktop))))
+
+  (export make-keys keys? keys-down! keys-up! keys-clear! keys-end-frame!
+          keys-held? keys-pressed? keys-released? keys-held keys-pressed
+          keys-poll! dom-key->symbol)
+
+  (begin
+    (define-struct keys
+      (held default: '() mutable: #t)
+      (pressed default: '() mutable: #t)
+      (released default: '() mutable: #t))
+
+    (define (make-keys) (keys))
+
+    ;; An auto-repeated keydown is not a second press.
+    (define (keys-down! ks k)
+      (unless (memq k (keys-held ks))
+        (set-keys-held! ks (cons k (keys-held ks)))
+        (set-keys-pressed! ks (cons k (keys-pressed ks)))))
+
+    (define (keys-up! ks k)
+      (when (memq k (keys-held ks))
+        (set-keys-held! ks (filter (lambda (x) (not (eq? x k))) (keys-held ks)))
+        (set-keys-released! ks (cons k (keys-released ks)))))
+
+    ;; Everything let go (a lost focus: a keyup that goes to another window
+    ;; would otherwise hold the key forever).
+    (define (keys-clear! ks)
+      (set-keys-released! ks (append (keys-held ks) (keys-released ks)))
+      (set-keys-held! ks '()))
+
+    (define (keys-end-frame! ks)
+      (set-keys-pressed! ks '())
+      (set-keys-released! ks '()))
+
+    (define (keys-held? ks k) (and (memq k (keys-held ks)) #t))
+    (define (keys-pressed? ks k) (and (memq k (keys-pressed ks)) #t))
+    (define (keys-released? ks k) (and (memq k (keys-released ks)) #t))
+
+    ;; Natively: feed the state from sigil-desktop's polls for the keys the
+    ;; game listens to. On the web the loader's events do it.
+    (cond-expand
+      (wasm
+       (define (keys-poll! ks names) #f))
+      (else
+       (define (keys-poll! ks names)
+         (for-each (lambda (k)
+                     (when (key-pressed? k) (keys-down! ks k))
+                     (when (key-released? k) (keys-up! ks k)))
+                   names))))
+
+    ;; A DOM KeyboardEvent.key -> sigil-desktop's name, or #f for a key
+    ;; with no name there. Letters are lower case whatever the shift.
+    (define DOM-NAMES
+      (list (cons "ArrowLeft" 'left) (cons "ArrowRight" 'right)
+            (cons "ArrowUp" 'up) (cons "ArrowDown" 'down)
+            (cons " " 'space) (cons "Enter" 'return) (cons "Escape" 'escape)
+            (cons "Tab" 'tab) (cons "Backspace" 'backspace) (cons "Delete" 'delete)
+            (cons "Shift" 'shift) (cons "Control" 'ctrl) (cons "Alt" 'alt)
+            (cons "Home" 'home) (cons "End" 'end)
+            (cons "PageUp" 'page-up) (cons "PageDown" 'page-down)
+            (cons "," 'comma) (cons "." 'period) (cons "/" 'slash)
+            (cons ";" 'semicolon) (cons "'" 'apostrophe) (cons "-" 'minus)
+            (cons "=" 'equal) (cons "[" 'left-bracket) (cons "]" 'right-bracket)
+            (cons "\\" 'backslash) (cons "`" 'grave)))
+
+    (define (dom-key->symbol k)
+      (let ((e (assoc k DOM-NAMES))
+            (n (string-length k)))
+        (cond (e (cdr e))
+              ((and (= n 1) (char-alphabetic? (string-ref k 0)))
+               (string->symbol (string (char-downcase (string-ref k 0)))))
+              ((and (= n 1) (char-numeric? (string-ref k 0)))
+               (string->symbol k))
+              ((and (>= n 2) (<= n 3) (char=? (string-ref k 0) #\F)
+                    (string->number (substring k 1 n)))
+               (string->symbol (string-append "f" (substring k 1 n))))
+              (else #f))))))

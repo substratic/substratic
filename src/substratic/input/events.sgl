@@ -1,0 +1,29 @@
+;;; (substratic input events) - The web's input events, into a key state
+;;; and a stick state.
+;;;
+;;;   ("keydown" | "keyup", DOM key)   from the loader
+;;;   ("stick", "NAME,DX,DY")          from the page's touch layer
+;;;   ("blur", _)                      the page lost focus: everything let go
+
+(define-library (substratic input events)
+  (import (substratic input keys)
+          (substratic input sticks))
+
+  (export input-dispatch!)
+
+  (begin
+    ;; #t when the event was one of the above.
+    (define (input-dispatch! ks st type payload)
+      (cond ((string=? type "keydown")
+             (let ((k (dom-key->symbol payload))) (when k (keys-down! ks k)) #t))
+            ((string=? type "keyup")
+             (let ((k (dom-key->symbol payload))) (when k (keys-up! ks k)) #t))
+            ((string=? type "stick")
+             (let ((p (parse-stick-payload payload)))
+               (when p (sticks-set! st (car p) (cadr p) (caddr p)))
+               #t))
+            ((string=? type "blur")
+             (keys-clear! ks)
+             (sticks-clear! st)
+             #t)
+            (else #f)))))

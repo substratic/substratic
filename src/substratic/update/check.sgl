@@ -1,4 +1,4 @@
-;;; (substratic update) - The version.json check: is there a newer version,
+;;; (substratic update check) - The version.json check: is there a newer version,
 ;;; and what is new in this one.
 ;;;
 ;;; A game's site publishes /version.json beside the game, generated at
@@ -37,75 +37,19 @@
 ;;; only showed what was waiting (it had a worker to compare for it); the
 ;;; desktop comparison and the once-per-version line are new.
 
-(define-library (substratic update)
+(define-library (substratic update check)
   (import (sigil struct)
           (sigil string)
-          (sigil list)
-          (sigil json)
-          (substratic store))
+          (substratic store kv)
+          (substratic update version))
 
-  (export version-info version-info? version-info-version version-info-date
-          version-info-stamp version-info-summary version-info-news
-          parse-version-info version-compare
-          make-updater updater? updater-running updater-info updater-waiting?
+  (export make-updater updater? updater-running updater-info updater-waiting?
           updater-set-info! updater-set-waiting! updater-dispatch!
           updater-status updater-line updater-mark-seen! updater-last-seen
           SEEN-KEY)
 
   (begin
     (define SEEN-KEY "update-seen")
-
-    (define-struct version-info
-      (version default: "")
-      (date default: #f)
-      (stamp default: #f)
-      (summary default: #f)
-      (news default: #f))
-
-    (define (string-field d name)
-      (let ((v (guard (e (#t #f)) (json-get-in d (list name)))))
-        (and (string? v) (> (string-length v) 0) v)))
-
-    ;; version.json's text -> a version-info, or #f (not JSON, not an
-    ;; object, no string "version").
-    (define (parse-version-info text)
-      (and (string? text)
-           (let ((d (guard (e (#t #f)) (json-decode text))))
-             (and d
-                  (not (string? d))
-                  (let ((v (string-field d 'version)))
-                    (and v
-                         (version-info version: v
-                                       date: (string-field d 'date)
-                                       stamp: (string-field d 'stamp)
-                                       summary: (string-field d 'summary)
-                                       news: (string-field d 'news))))))))
-
-    ;; --- comparing versions --------------------------------------------------
-
-    ;; "0.1.10" -> (0 1 10); a part that is not a number stays a string
-    ;; ("1.0.0-rc1" -> (1 0 "0-rc1")).
-    (define (version-parts v)
-      (map (lambda (p) (or (string->number p) p)) (string-split v ".")))
-
-    (define (part-compare a b)
-      (cond ((and (number? a) (number? b)) (cond ((< a b) -1) ((> a b) 1) (else 0)))
-            ((number? a) 1)          ; a plain number is newer than a tagged one
-            ((number? b) -1)
-            ((string<? a b) -1)
-            ((string<? b a) 1)
-            (else 0)))
-
-    ;; -1, 0 or 1 as a is older than, the same as, or newer than b. Missing
-    ;; trailing parts count as 0 ("0.2" = "0.2.0").
-    (define (version-compare a b)
-      (let loop ((pa (version-parts a)) (pb (version-parts b)))
-        (cond ((and (null? pa) (null? pb)) 0)
-              (else
-               (let ((c (part-compare (if (null? pa) 0 (car pa)) (if (null? pb) 0 (car pb)))))
-                 (if (= c 0)
-                     (loop (if (null? pa) '() (cdr pa)) (if (null? pb) '() (cdr pb)))
-                     c))))))
 
     ;; --- the updater -----------------------------------------------------------
 

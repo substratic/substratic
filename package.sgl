@@ -48,6 +48,26 @@
     ;; Web only: localStorage for (substratic store).
     (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
 
+  ;; (substratic image capture): glReadPixels through sigil-desktop's GL proc
+  ;; loader natively; a stub answering #f on the web.
+  libraries: (list
+    (library
+      name: 'substratic
+      c-sources: '("src/c/capture.c")
+      native-init: "sigil__init_substratic_image_capture_module"))
+
   dev-dependencies: (list
     (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
-    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7")))
+    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build substratic: its C library and its modules"
+      steps: (list
+        (compile-c-sources
+          sources: '("src/c/capture.c")
+          flags: (with-sigil-c-flags '("-std=c99" "-Wno-unused-parameter")))
+        (create-static-library name: "substratic")
+        (compile-sigil-modules sources: "src/**/*.sgl"
+                               output-dir: (config-output-subdir "lib"))))))

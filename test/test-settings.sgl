@@ -1,11 +1,11 @@
-;;; (substratic settings): the pure verbs on a table the test declares,
+;;; (substratic store settings): the pure verbs on a table the test declares,
 ;;; the store round trip, and the schema-version reset (the cases Crash
 ;;; The Stack's settings test covers, on a generic table).
 
 (import (sigil test)
         (sigil time)
-        (substratic store)
-        (substratic settings))
+        (substratic store kv)
+        (substratic store settings))
 
 (define ROWS
   (list (setting id: 'music name: "MUSIC" values: (list 'on 'off) default: 'on key: "music")

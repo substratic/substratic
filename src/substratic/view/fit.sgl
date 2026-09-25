@@ -1,4 +1,4 @@
-;;; (substratic view) - A fixed-size pixel view placed on a window at a
+;;; (substratic view fit) - A fixed-size pixel view placed on a window at a
 ;;; whole-number scale.
 ;;;
 ;;; The game draws into a render target the size of its view (say 400x176)
@@ -13,7 +13,7 @@
 ;;; view is drawn at the next whole scale up into a linear-sampled target,
 ;;; and that target is drawn at the float fit ("sharp bilinear": each view
 ;;; pixel is a crisp block with at most one blended row at its edge).
-;;; view-present! does both.
+;;; (substratic view present) draws both.
 ;;;
 ;;; A desktop window that only ever wants whole scales (black around the
 ;;; view, never 'sharp, whatever size the window manager gives) passes
@@ -28,14 +28,12 @@
 ;;; module state there; here it is an argument, so two views in one game
 ;;; cannot disagree about it.
 
-(define-library (substratic view)
+(define-library (substratic view fit)
   (import (sigil struct)
-          (sigil math)
-          (sigil graphics))
+          (sigil math))
 
   (export fit fit? fit-mode fit-scale fit-x fit-y fit-w fit-h fit-up
-          view-fit window->view SHARP-BELOW
-          presenter presenter? make-presenter view-present!)
+          view-fit window->view SHARP-BELOW)
 
   (begin
     ;; The integer fit must cover at least this share of the limiting side
@@ -88,39 +86,4 @@
       (let ((vx (/ (* 1.0 (- x (fit-x f))) (/ (* 1.0 (fit-w f)) vw)))
             (vy (/ (* 1.0 (- y (fit-y f))) (/ (* 1.0 (fit-h f)) vh))))
         (and (>= vx 0.0) (< vx vw) (>= vy 0.0) (< vy vh)
-             (cons vx vy))))
-
-    ;; --- drawing a view target at its fit --------------------------------------
-
-    ;; The intermediate target for 'sharp, made at the first 'sharp fit and
-    ;; remade when the whole scale above changes.
-    (define-struct presenter
-      (vw default: 0)
-      (vh default: 0)
-      (sharp default: #f mutable: #t)
-      (sharp-up default: 0 mutable: #t))
-
-    (define (make-presenter vw vh)
-      (presenter vw: vw vh: vh))
-
-    (define (ensure-sharp! p up)
-      (unless (= up (presenter-sharp-up p))
-        (when (presenter-sharp p) (render-target-free! (presenter-sharp p)))
-        (set-presenter-sharp-up! p up)
-        (set-presenter-sharp! p (make-render-target (* (presenter-vw p) up) (* (presenter-vh p) up) 'linear))))
-
-    ;; Draw the view target (a 'nearest render target the size of the view)
-    ;; onto the window at fit f, inside the caller's frame (after
-    ;; begin-frame). Copied opaque (blend none): a translucent draw into the
-    ;; view lowers its alpha, and blended over the black window those pixels
-    ;; would come out dark. The window around the view is the letterbox
-    ;; colour the caller clears to.
-    (define (view-present! p view-rt f)
-      (with-blend-mode 'none
-        (if (eq? (fit-mode f) 'integer)
-            (draw-render-target view-rt (fit-x f) (fit-y f) (fit-w f) (fit-h f))
-            (let ((up (fit-up f)))
-              (ensure-sharp! p up)
-              (with-render-target (presenter-sharp p)
-                (draw-render-target view-rt 0 0 (* (presenter-vw p) up) (* (presenter-vh p) up)))
-              (draw-render-target (presenter-sharp p) (fit-x f) (fit-y f) (fit-w f) (fit-h f))))))))
+             (cons vx vy))))))

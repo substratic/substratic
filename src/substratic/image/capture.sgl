@@ -1,0 +1,18 @@
+;;; (substratic image capture) - The frame just drawn, as pixels.
+;;;
+;;; capture-frame reads the window's framebuffer after the frame's
+;;; end-frame and before the next wait-frame: w*h*4 RGBA8 bytes, rows top
+;;; first, or #f (no GL context, a GL error, or the web, where the page
+;;; takes the screenshot from the canvas). %capture-frame is the C native
+;;; (src/c/capture.c), rows bottom first.
+
+(define-library (substratic image capture)
+  (import (sigil core)
+          (substratic image png))
+
+  (export %capture-frame capture-frame)
+
+  (begin
+    (define (capture-frame w h)
+      (let ((raw (guard (e (#t #f)) (%capture-frame w h))))
+        (and raw (flip-rows w h raw))))))

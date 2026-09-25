@@ -1,0 +1,49 @@
+;;; (substratic view present) - Draw a view's render target at its fit.
+;;;
+;;; An 'integer fit is one draw of the view target at the whole scale. A
+;;; 'sharp fit ("sharp bilinear") draws the view at the next whole scale up
+;;; into a linear-sampled intermediate target, then that target at the
+;;; float fit, so each view pixel is a crisp block with at most one blended
+;;; row at its edge. A presenter keeps the intermediate target, made at the
+;;; first 'sharp fit and remade when the whole scale above changes.
+;;;
+;;; Lifted from Harkfell's shell, which drew its room this way.
+
+(define-library (substratic view present)
+  (import (sigil struct)
+          (sigil graphics)
+          (substratic view fit))
+
+  (export presenter presenter? make-presenter view-present!)
+
+  (begin
+    (define-struct presenter
+      (vw default: 0)
+      (vh default: 0)
+      (sharp default: #f mutable: #t)
+      (sharp-up default: 0 mutable: #t))
+
+    (define (make-presenter vw vh)
+      (presenter vw: vw vh: vh))
+
+    (define (ensure-sharp! p up)
+      (unless (= up (presenter-sharp-up p))
+        (when (presenter-sharp p) (render-target-free! (presenter-sharp p)))
+        (set-presenter-sharp-up! p up)
+        (set-presenter-sharp! p (make-render-target (* (presenter-vw p) up) (* (presenter-vh p) up) 'linear))))
+
+    ;; Draw the view target (a 'nearest render target the size of the view)
+    ;; onto the window at fit f, inside the caller's frame (after
+    ;; begin-frame). Copied opaque (blend none): a translucent draw into the
+    ;; view lowers its alpha, and blended over the black window those pixels
+    ;; would come out dark. The window around the view is whatever the
+    ;; caller cleared it to (black, for a letterbox).
+    (define (view-present! p view-rt f)
+      (with-blend-mode 'none
+        (if (eq? (fit-mode f) 'integer)
+            (draw-render-target view-rt (fit-x f) (fit-y f) (fit-w f) (fit-h f))
+            (let ((up (fit-up f)))
+              (ensure-sharp! p up)
+              (with-render-target (presenter-sharp p)
+                (draw-render-target view-rt 0 0 (* (presenter-vw p) up) (* (presenter-vh p) up)))
+              (draw-render-target (presenter-sharp p) (fit-x f) (fit-y f) (fit-w f) (fit-h f))))))))

@@ -1,4 +1,4 @@
-;;; (substratic png) - RGBA pixels to a PNG file's bytes.
+;;; (substratic image png) - RGBA pixels to a PNG file's bytes.
 ;;;
 ;;; For the playtest screenshot on the desktop: no image library is linked,
 ;;; so the encoder is here, small and plain. The image is 8-bit RGBA, no
@@ -10,7 +10,7 @@
 ;;; rgba->png takes the rows top first. flip-rows turns the bottom-first
 ;;; rows glReadPixels gives into that order.
 
-(define-library (substratic png)
+(define-library (substratic image png)
   (import (sigil math))
 
   (export rgba->png flip-rows crc32 adler32)

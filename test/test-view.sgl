@@ -1,9 +1,9 @@
-;;; The view's placement on a window ((substratic view)): the largest whole
+;;; The view's placement on a window ((substratic view fit)): the largest whole
 ;;; scale in device pixels, centered; the sharp fallback where no whole
 ;;; scale covers enough; and the window->view inverse.
 
 (import (sigil test)
-        (substratic view))
+        (substratic view fit))
 
 (test-group "view fit"
   (test "a 1000x621 canvas takes the 400x176 view at 2x, centered"

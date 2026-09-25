@@ -1,0 +1,194 @@
+;;; (substratic playtest session, json): the readout, the input log, the report as JSON,
+;;; the desktop save (with a fake capturer, since a test has no window),
+;;; and the web's capture line and page events.
+
+(import (sigil test)
+        (sigil io)
+        (sigil fs)
+        (sigil time)
+        (sigil string)
+        (sigil json)
+        (substratic store kv)
+        (substratic image png)
+        (substratic playtest json)
+        (substratic playtest session))
+
+(define (describe)
+  (list (cons 'region "hollow") (cons 'room "x3y2") (cons 'cell (cons 4 7))
+        (cons 'position (cons 123.46 88.0)) (cons 'items (list "h2" "h3"))))
+
+(define (snapshot) (list 'save 3 (list 'room "x3y2") (vector 1 2)))
+
+(define (fresh . args)
+  (make-playtest game: "demo" build: "abc123" platform: (if (pair? args) (car args) 'desktop)
+                 describe: describe snapshot: snapshot enabled: #t))
+
+(define (card w h)
+  (let ((bv (make-bytevector (* w h 4) 0)))
+    (let loop ((i 0))
+      (when (< i (* w h 4)) (bytevector-u8-set! bv i (modulo i 251)) (loop (+ i 1))))
+    bv))
+
+(define root (string-append "/tmp/substratic-test-playtest-" (number->string (current-jiffy))))
+
+(test-group "playtest: disabled is a no-op"
+  (test "F1 and F2 reach the game; nothing is taken"
+    (let ((p (make-playtest describe: describe)))
+      (assert-false (playtest-key! p 'f1))
+      (assert-false (playtest-key! p 'f2))
+      (assert-false (playtest-dispatch! p "keydown" "F2"))
+      (assert-false (playtest-busy? p))
+      (assert-false (playtest-readout? p)))))
+
+(test-group "playtest: the readout"
+  (test "F1 toggles it"
+    (let ((p (fresh)))
+      (assert-true (playtest-key! p 'f1))
+      (assert-true (playtest-readout? p))
+      (playtest-key! p 'f1)
+      (assert-false (playtest-readout? p))))
+  (test "the build, the tick, and every entry of the description"
+    (let ((p (fresh)))
+      (playtest-tick! p 1234)
+      (playtest-room-entered! p 1200)
+      (assert-equal (list "demo abc123  tick 1234 (room +34)"
+                          "region hollow  room x3y2  cell 4,7  position 123.5,88  items h2 h3")
+                    (playtest-readout-lines p 80))))
+  (test "entries wrap whole into narrow lines"
+    (let ((ls (playtest-readout-lines (fresh) 30)))
+      (assert-equal "region hollow  room x3y2" (cadr ls))
+      (assert-equal "cell 4,7  position 123.5,88" (caddr ls))
+      (assert-equal "items h2 h3" (cadddr ls))))
+  (test "a description that raises is shown, not thrown"
+    (let ((p (make-playtest enabled: #t describe: (lambda () (error "no room")))))
+      (assert-true (string-contains? (cadr (playtest-readout-lines p 80)) "describe-error")))))
+
+(test-group "playtest: the input log"
+  (test "only changes are kept, from the room's entry"
+    (let ((p (fresh)))
+      (playtest-record-input! p 5 '(left))
+      (playtest-room-entered! p 10)
+      (playtest-record-input! p 10 '())
+      (playtest-record-input! p 11 '())
+      (playtest-record-input! p 12 '(right))
+      (playtest-record-input! p 13 '(right))
+      (playtest-record-input! p 14 '(right jump))
+      (assert-equal '((10) (12 right) (14 right jump)) (playtest-input-log p)))))
+
+(test-group "playtest: datums as JSON"
+  (test "alists are objects, lists arrays, pairs two-element arrays"
+    (assert-equal "{\"a\":1,\"b\":[1,2],\"c\":[\"x\",\"y\"]}"
+                  (datum->json (list (cons 'a 1) (cons 'b (cons 1 2)) (cons 'c (list 'x "y"))))))
+  (test "the empty list, booleans, vectors, non-finite numbers"
+    (assert-equal "[[],true,false,[1,2],null]"
+                  (datum->json (list '() #t #f (vector 1 2) (* 1e300 1e300)))))
+  (test "strings are escaped"
+    (assert-equal "\"a\\\"b\"" (datum->json "a\"b"))))
+
+(test-group "playtest: the report"
+  (test "report.json parses and carries the location, state, input and note"
+    (let ((p (fresh)))
+      (playtest-tick! p 50)
+      (playtest-room-entered! p 40)
+      (playtest-record-input! p 41 '(left))
+      (let ((d (json-decode (playtest-report-json p "the ledge is too high" "screenshot.png"))))
+        (assert-equal "demo" (json-get-in d '(game)))
+        (assert-equal "abc123" (json-get-in d '(build)))
+        (assert-equal 50 (json-get-in d '(tick)))
+        (assert-equal "x3y2" (json-get-in d '(location room)))
+        (assert-equal 7 (json-get-in d '(location cell 1)))
+        (assert-equal "h3" (json-get-in d '(location items 1)))
+        (assert-equal 40 (json-get-in d '(input room-entered-tick)))
+        (assert-equal "left" (json-get-in d '(input log 0 1 0)))
+        (assert-equal "the ledge is too high" (json-get-in d '(note)))
+        (assert-equal "screenshot.png" (json-get-in d '(screenshot)))
+        (assert-equal (snapshot) (read (open-input-string (json-get-in d '(state-sexp))))))))
+  (test "no input log for a game that never recorded one"
+    (let ((d (json-decode (playtest-report-json (fresh) "" #f))))
+      (assert-false (json-get-in d '(input)))
+      (assert-true (json-null? (json-get-in d '(screenshot)))))))
+
+(test-group "playtest: F2 on the desktop"
+  (test "F2 takes the report, the frame's end reads the pixels, a note is typed and saved"
+    (set-store-root! (string-append root "-desk"))
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) (card w h)))
+      (playtest-tick! p 7)
+      (assert-true (playtest-key! p 'f2))
+      (assert-true (playtest-busy? p))
+      (assert-equal 'pending (playtest-phase p))
+      (playtest-tick! p 8)                       ; the report was taken at F2
+      (playtest-after-frame! p 20 10)
+      (assert-equal 'note (playtest-phase p))
+      (for-each (lambda (c) (playtest-type! p c)) (string->list "Stuck, here!"))
+      (assert-true (playtest-key! p 'backspace))
+      (assert-true (playtest-key! p 'x))         ; every key is the note's while it is open
+      (assert-equal "Stuck, here" (playtest-note p))
+      (let ((dir (with-output-to-string (lambda () (playtest-key! p 'return)))))
+        (assert-true (string-contains? dir "substratic: playtest report ")))
+      (assert-false (playtest-busy? p))
+      (let* ((dir (playtest-last-dir p))
+             (report (json-decode (utf8->string (read-file-bytes (string-append dir "/report.json")))))
+             (png (read-file-bytes (string-append dir "/screenshot.png"))))
+        (assert-true (string-contains? dir "/reports/"))
+        (assert-equal "Stuck, here" (json-get-in report '(note)))
+        (assert-equal 7 (json-get-in report '(tick)))
+        (assert-equal (rgba->png 20 10 (card 20 10)) png))))
+  (test "a second report in the same second gets its own directory"
+    (set-store-root! (string-append root "-twice"))
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) (card w h)))
+      (with-output-to-string
+        (lambda ()
+          (playtest-key! p 'f2) (playtest-after-frame! p 4 4) (playtest-key! p 'return)
+          (let ((first (playtest-last-dir p)))
+            (playtest-key! p 'f2) (playtest-after-frame! p 4 4) (playtest-key! p 'return)
+            (assert-false (string=? first (playtest-last-dir p))))))))
+  (test "no pixels still saves the report, without a screenshot"
+    (set-store-root! (string-append root "-noshot"))
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) #f))
+      (playtest-key! p 'f2)
+      (playtest-after-frame! p 20 10)
+      (with-output-to-string (lambda () (playtest-key! p 'return)))
+      (let ((dir (playtest-last-dir p)))
+        (assert-true (file-exists? (string-append dir "/report.json")))
+        (assert-false (file-exists? (string-append dir "/screenshot.png"))))))
+  (test "escape discards: nothing is written"
+    (set-store-root! (string-append root "-discard"))
+    (let ((p (fresh)))
+      (playtest-set-capturer! p (lambda (w h) (card w h)))
+      (playtest-key! p 'f2)
+      (playtest-after-frame! p 20 10)
+      (playtest-key! p 'escape)
+      (assert-false (playtest-busy? p))
+      (assert-false (playtest-last-dir p))
+      (assert-false (file-exists? (string-append root "-discard/reports"))))))
+
+(test-group "playtest: F2 on the web"
+  (test "the frame's end prints one capture line the page can parse"
+    (let* ((p (fresh 'web))
+           (_ (assert-true (playtest-dispatch! p "keydown" "F2")))
+           (out (with-output-to-string (lambda () (playtest-after-frame! p 800 352)))))
+      (assert-true (string-starts-with? out CAPTURE-PREFIX))
+      (let* ((line (substring out (string-length CAPTURE-PREFIX) (- (string-length out) 1)))
+             (d (json-decode line)))
+        (assert-equal "web" (json-get-in d '(platform)))
+        (assert-equal "x3y2" (json-get-in d '(location room))))
+      (assert-equal 'page (playtest-phase p))
+      (assert-true (playtest-busy? p))))
+  (test "keys reach the game again only after the page's answer"
+    (let ((p (fresh 'web)))
+      (playtest-dispatch! p "playtest" "capture")
+      (with-output-to-string (lambda () (playtest-after-frame! p 8 8)))
+      (assert-true (playtest-dispatch! p "keydown" "a"))
+      (assert-true (playtest-dispatch! p "playtest" "saved reports/20260925-120000"))
+      (assert-false (playtest-busy? p))
+      (assert-equal "reports/20260925-120000" (playtest-last-dir p))
+      (assert-false (playtest-dispatch! p "keydown" "a"))))
+  (test "a failure is said, and play goes on"
+    (let ((p (fresh 'web)))
+      (playtest-dispatch! p "playtest" "capture")
+      (playtest-dispatch! p "playtest" "failed no server")
+      (assert-false (playtest-busy? p))
+      (assert-equal "report NOT saved: no server" (playtest-message p)))))
