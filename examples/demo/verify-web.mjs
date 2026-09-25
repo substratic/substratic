@@ -126,6 +126,14 @@ const upd = await waitLine((l) => l.startsWith("substratic-demo: update "), 1000
 if (upd === "substratic-demo: update new-in New in 0.1.0: The first demo: six rooms, six gems, and F2.") pass("update line (new in)");
 else fail("update", String(upd));
 
+// ---- the loader's key dispatches, watched below the game --------------------------
+// A spy on the app's dispatch records every keydown the loader delivers,
+// before any game-side guard can hide it: the stick drag must add no arrow
+// key (the loader's swipe detector would), q pressed outside the note must
+// show up (the positive control), and the note's typing must not.
+await evaluate(`(() => { const a = globalThis.SigilWebApp; window.__keys = []; const d = a.dispatch.bind(a);
+  a.dispatch = function (t, p) { if (t === "keydown") window.__keys.push(p); return d(t, p); }; return true; })()`);
+
 // ---- a touch stick ---------------------------------------------------------------------
 const box = await evaluate("(() => { const r = document.querySelector('#stage').getBoundingClientRect(); return [r.width, r.height]; })()");
 const [W, H] = box;
@@ -142,13 +150,9 @@ for (let dx = 10; dx <= 60; dx += 10) {
 await sleep(1500);
 await cdp("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 await sleep(300);
+const swiped = (await evaluate("window.__keys")).filter((k) => k.startsWith("Arrow"));
+if (swiped.length === 0) pass("the stick drag sent no arrow key"); else fail("stick", `the drag also sent ${swiped.join(", ")} (the loader's swipe)`);
 
-// ---- the loader's key dispatches, watched below the game --------------------------
-// A spy on the app's dispatch records every keydown the loader delivers,
-// before any game-side guard can hide it. q, pressed outside the note, must
-// show up (the positive control); the note's typing must not.
-await evaluate(`(() => { const a = globalThis.SigilWebApp; window.__keys = []; const d = a.dispatch.bind(a);
-  a.dispatch = function (t, p) { if (t === "keydown") window.__keys.push(p); return d(t, p); }; return true; })()`);
 await key("q", "KeyQ", 81);
 await sleep(200);
 if ((await evaluate("window.__keys")).includes("q")) pass("a key outside the note reaches the loader's dispatch (the spy works)");

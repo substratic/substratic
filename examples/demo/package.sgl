@@ -15,7 +15,14 @@
 
 ;; The build's stamp: the commit, plus the second when the tree was dirty.
 (define (build-stamp)
-  (or (let ((s (getenv "SUBSTRATIC_DEMO_STAMP"))) (and s (> (string-length s) 0) s))
+  (or (let ((s (getenv "SUBSTRATIC_DEMO_STAMP")))
+        ;; spliced into JSON and HTML: letters, digits, . _ - only
+        (and s (> (string-length s) 0)
+             (let loop ((cs (string->list s)))
+               (or (null? cs)
+                   (and (let ((c (car cs))) (or (char-alphabetic? c) (char-numeric? c) (memv c (list #\. #\_ #\-))))
+                        (loop (cdr cs)))))
+             s))
       (build-stamp-from-git)))
 
 ;; A build from a tarball (no .git) says so unless the stamp is given.

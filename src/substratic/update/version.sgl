@@ -49,27 +49,68 @@
 
     ;; A part as (number . tag): "10" -> (10 . ""), "0-rc1" -> (0 . "-rc1"),
     ;; "beta" -> (#f . "beta").
+    (define (ascii-digit? c) (and (char>=? c #\0) (char<=? c #\9)))
+
     (define (part-split p)
       (let loop ((i 0))
-        (if (and (< i (string-length p)) (char-numeric? (string-ref p i)))
+        (if (and (< i (string-length p)) (ascii-digit? (string-ref p i)))
             (loop (+ i 1))
             (cons (and (> i 0) (string->number (substring p 0 i)))
                   (substring p i (string-length p))))))
 
+    ;; "v1.2.3+build.7" -> "1.2.3": a leading v is not part of the version,
+    ;; and build metadata after + does not order releases (semver).
+    (define (normalise v)
+      (let* ((v (if (and (> (string-length v) 0) (memv (string-ref v 0) '(#\v #\V)))
+                    (substring v 1 (string-length v))
+                    v))
+             (plus (string-index v (lambda (c) (char=? c #\+)))))
+        (if plus (substring v 0 plus) v)))
+
     (define (version-parts v)
-      (map part-split (string-split v ".")))
+      (map part-split (string-split (normalise v) ".")))
+
+    ;; A tag as runs: "-rc10" -> ("-rc" 10), so digits compare as numbers.
+    (define (runs s)
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond ((= i (string-length s))
+               (reverse (if (< start i) (cons (run s start i) acc) acc)))
+              ((and (> i start)
+                    (not (eq? (ascii-digit? (string-ref s i)) (ascii-digit? (string-ref s start)))))
+               (loop i i (cons (run s start i) acc)))
+              (else (loop (+ i 1) start acc)))))
+
+    (define (run s start end)
+      (let ((t (substring s start end)))
+        (if (ascii-digit? (string-ref t 0)) (string->number t) t)))
+
+    ;; Natural order: numbers by value, text by text, a number before text,
+    ;; and a shorter tag that is a prefix of a longer one first.
+    (define (tag-compare a b)
+      (let loop ((ra (runs a)) (rb (runs b)))
+        (cond ((and (null? ra) (null? rb)) 0)
+              ((null? ra) -1)
+              ((null? rb) 1)
+              (else
+               (let ((x (car ra)) (y (car rb)))
+                 (cond ((and (number? x) (number? y))
+                        (cond ((< x y) -1) ((> x y) 1) (else (loop (cdr ra) (cdr rb)))))
+                       ((number? x) -1)
+                       ((number? y) 1)
+                       ((string<? x y) -1)
+                       ((string<? y x) 1)
+                       (else (loop (cdr ra) (cdr rb)))))))))
 
     ;; The numbers first; at equal numbers a plain part is newer than a
-    ;; tagged one ("1.0.0" > "1.0.0-rc1"), and two tags compare as text.
+    ;; tagged one ("1.0.0" > "1.0.0-rc1"), and two tags compare naturally
+    ;; ("-rc10" > "-rc9").
     (define (part-compare a b)
       (let ((na (or (car a) -1)) (nb (or (car b) -1)) (ta (cdr a)) (tb (cdr b)))
         (cond ((< na nb) -1)
               ((> na nb) 1)
               ((and (string=? ta "") (not (string=? tb ""))) 1)
               ((and (string=? tb "") (not (string=? ta ""))) -1)
-              ((string<? ta tb) -1)
-              ((string<? tb ta) 1)
-              (else 0))))
+              (else (tag-compare ta tb)))))
 
     ;; -1, 0 or 1 as a is older than, the same as, or newer than b. Missing
     ;; trailing parts count as 0 ("0.2" = "0.2.0").

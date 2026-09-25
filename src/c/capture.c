@@ -94,6 +94,9 @@ static Value native_capture_frame(SigilVM *vm, int argc, Value *args)
     read_buffer(SUB_GL_BACK);
     pixel_store(SUB_GL_PACK_ALIGNMENT, 1);
     pixel_store(SUB_GL_PACK_ROW_LENGTH, 0);
+    /* a query above may itself fail on an older context (GL_INVALID_ENUM on
+     * GLES2): drain again, so only the read's own error decides */
+    for (int i = 0; i < 16 && get_error() != 0; i++) { }
     read_pixels(0, 0, w, h, SUB_GL_RGBA, SUB_GL_UNSIGNED_BYTE, sigil_bytevector_data(bv));
     GLenum err = get_error();
 

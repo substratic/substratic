@@ -246,9 +246,15 @@
     send("playtest", "opened");
   }
   function closeNote() { note.style.display = "none"; capture = null; var c = canvasEl(); if (c && c.focus) c.focus(); }
+  // While a report is being sent, Cancel and Escape wait for the answer: the
+  // server may already have written it, and "discarded" must not be said of
+  // a report on disk. A send that fails (or takes over SEND-TIMEOUT) leaves
+  // the note open with its text, so Enter tries again and Escape discards,
+  // as on the desktop.
+  var SEND_TIMEOUT = 15000;
   function cancel() {
     if (!capture) return;
-    if (capture.sending) capture.sending.abort();
+    if (capture.sending) { status("saving... (wait for the answer)"); return; }
     closeNote(); send("playtest", "cancel");
   }
   function submit() {
@@ -262,18 +268,25 @@
     report.page = { url: location.href, build: meta ? meta.content : null, userAgent: navigator.userAgent, dpr: window.devicePixelRatio || 1,
                     width: window.innerWidth, height: window.innerHeight };
     status("saving...");
-    mine.sending = new AbortController();
+    var ctl = new AbortController();
+    mine.sending = ctl;
+    var timer = setTimeout(function () { ctl.abort(); }, SEND_TIMEOUT);
     var body = JSON.stringify({ report: report, png: mine.png });
-    fetch(cfg.reportUrl, { method: "POST", headers: { "content-type": "application/json" }, body: body, signal: mine.sending.signal })
-      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    fetch(cfg.reportUrl, { method: "POST", headers: { "content-type": "application/json" }, body: body, signal: ctl.signal })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }, function () { return { ok: false, j: { error: "HTTP " + r.status } }; }); })
       .then(function (res) {
+        clearTimeout(timer);
         if (!res.ok || !res.j.dir) throw new Error((res.j && res.j.error) || "the server said no");
         if (capture !== mine) return;
         closeNote(); send("playtest", "saved " + res.j.dir);
       })
       .catch(function (err) {
+        clearTimeout(timer);
         if (capture !== mine) return;
-        closeNote(); send("playtest", "failed " + (err.message || String(err)));
+        mine.sending = null;
+        var why = err.name === "AbortError" ? "no answer in " + (SEND_TIMEOUT / 1000) + " s" : (err.message || String(err));
+        status("NOT saved: " + why + ". Enter tries again, Esc discards.");
+        console.log("substratic: playtest not saved " + why);
       });
   }
   if (playtestOn) {

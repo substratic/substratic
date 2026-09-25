@@ -45,7 +45,16 @@
     (assert-equal 1 (version-compare "1.0.1-rc1" "1.0.0"))
     (assert-equal -1 (version-compare "1.0.0" "1.0.1-rc1")))
   (test "two tags compare as text"
-    (assert-equal 1 (version-compare "1.0.0-rc2" "1.0.0-rc1"))))
+    (assert-equal 1 (version-compare "1.0.0-rc2" "1.0.0-rc1")))
+  (test "tags compare their numbers as numbers"
+    (assert-equal 1 (version-compare "1.0.0-rc10" "1.0.0-rc9"))
+    (assert-equal -1 (version-compare "1.0.0-rc9" "1.0.0-rc10"))
+    (assert-equal 1 (version-compare "1.0.0-rc.10" "1.0.0-rc.9")))
+  (test "a leading v and build metadata do not order releases"
+    (assert-equal 1 (version-compare "v10.0" "v9.0"))
+    (assert-equal 0 (version-compare "v1.2.3" "1.2.3"))
+    (assert-equal 0 (version-compare "1.0.0+build5" "1.0.0"))
+    (assert-equal 1 (version-compare "1.0.1+b" "1.0.0+c"))))
 
 (define root (string-append "/tmp/substratic-test-update-" (number->string (current-jiffy))))
 

@@ -286,6 +286,8 @@
         (set-playtest-taken! p (take-report p))
         (set-playtest-pixels! p #f)
         (set-playtest-note! p "")
+        (set-playtest-message! p #f)          ; the last report's message is not this one's
+        (set-playtest-message-left! p 0)
         (set-playtest-phase! p 'pending)))
 
     ;; The frame as PNG bytes, or #f.
@@ -342,14 +344,26 @@
          (let loop ((n 1))
            (let ((d (if (= n 1) base (string-append base "-" (number->string n)))))
              (if (file-exists? d) (loop (+ n 1)) d))))
+       ;; A save that fails part-way leaves nothing behind: whatever it wrote
+       ;; is removed, best effort, so a retry is not beside a half report.
+       (define (remove-partial! dir)
+         (when dir
+           (for-each (lambda (f)
+                       (let ((path (string-append dir "/" f)))
+                         (guard (e (#t #f)) (when (file-exists? path) (delete-file path)))))
+                     (list "screenshot.png" "report.json"))
+           (guard (e (#t #f)) (when (file-exists? dir) (delete-directory dir)))))
+
        (define (write-report! p)
+         (define dir #f)
          (guard (e (#t (let ((why (string-append "report NOT saved: " (condition->text e))))
+                         (remove-partial! dir)
                          (say! p why)
                          (display (string-append "substratic: playtest " why)) (newline))
                        #f))
-           (let* ((dir (free-dir (string-append (store-root) "/reports/" (report-stamp))))
-                  (px (playtest-pixels p))
+           (let* ((px (playtest-pixels p))
                   (shot (and px "screenshot.png")))
+             (set! dir (free-dir (string-append (store-root) "/reports/" (report-stamp))))
              (ensure-directory dir)
              (when px
                (write-file-bytes (string-append dir "/screenshot.png")
@@ -525,13 +539,18 @@
                    (shown (if (> (string-length field) cols)
                               (substring field (- (string-length field) cols) (string-length field))
                               field))
-                   (ls (list head shown "enter saves   esc discards"))
+                   ;; a failed save's reason is shown inside the note, above
+                   ;; the keys, never over them
+                   (failed (and (playtest-message p) (pack (list (playtest-message p)) cols)))
+                   (ls (append (list head shown)
+                               (or failed '())
+                               (list (if failed "enter tries again   esc discards" "enter saves   esc discards"))))
                    (h (+ (* 2 pad) (* line-h (length ls))))
                    (y (- win-h h (* 4 s))))
               (panel! 0 y win-w h)
               (set-color 1.0 0.9 0.5 1.0)
               (lines! ls pad (+ y pad s) s)))
-          (when (playtest-message p)
+          (when (and (playtest-message p) (not (eq? (playtest-phase p) 'note)))
             (let* ((ls (pack (list (playtest-message p)) cols))
                    (h (+ (* 2 pad) (* line-h (length ls))))
                    (y (- win-h h)))

@@ -34,6 +34,8 @@ function unspecified(a) {
   return /^[0:]+$/.test(s);
 }
 if (unspecified(host)) { console.error(`serve: refusing to bind to ${host}`); process.exit(2); }
+const bare = host.replace(/^\[|\]$/g, "");
+const allowedHosts = new Set([bare].concat(bare === "127.0.0.1" || bare === "::1" ? ["localhost", "127.0.0.1", "::1"] : []));
 const tlsDir = flag("--tls");
 const root = path.resolve(dir);
 const reports = path.resolve(flag("--reports") || "reports");
@@ -104,10 +106,18 @@ function handler(req, res) {
 function handle(req, res) {
   const u = new URL(req.url, "http://x");
   if (u.pathname.endsWith("/playtest-report")) {
-    // a page from another origin (any site the developer has open) may not
-    // write reports here
+    // Reports come only from this server's own pages: the Host must name
+    // the address the server was started on (a DNS-rebound name would not),
+    // and an Origin, when sent, must be that same host.
+    let hostName = "";
+    try { hostName = new URL(`http://${req.headers.host || ""}`).hostname.replace(/^\[|\]$/g, ""); } catch { /* answered below */ }
+    if (!allowedHosts.has(hostName)) return answer(res, 403, { error: "not this server's host" });
     const origin = req.headers.origin;
-    if (origin && new URL(origin).host !== req.headers.host) return answer(res, 403, { error: "another origin" });
+    if (origin) {
+      let o = null;
+      try { o = new URL(origin); } catch { /* "null", or junk */ }
+      if (!o || o.host !== req.headers.host) return answer(res, 403, { error: "another origin" });
+    }
     if (req.method !== "POST") return answer(res, 405, { error: "POST a report" });
     return report(req, res);
   }

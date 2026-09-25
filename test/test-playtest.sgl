@@ -217,15 +217,15 @@
     (let ((p (web-captured)))
       (assert-true (playtest-dispatch! p "keydown" "Escape"))
       (assert-false (playtest-busy? p))))
-  (test "a late answer to an earlier report does not end this one"
+  (test "an answer while a report is awaited ends it (the page, not the game, ties answers to their capture)"
     (let ((p (web-captured)))
       (playtest-dispatch! p "playtest" "cancel")
       (playtest-dispatch! p "playtest" "capture")
       (with-output-to-string (lambda () (playtest-after-frame! p 8 8)))
       (playtest-dispatch! p "playtest" "opened")
       (with-output-to-string (lambda () (playtest-dispatch! p "playtest" "saved reports/old")))
-      ;; the stale answer is recorded as said, but only because this report is the
-      ;; one awaited does it end; the page ties answers to their capture as well
+      ;; the game cannot tell whose answer this is: it ends the awaited report.
+      ;; substratic.js drops answers whose capture is no longer open.
       (assert-false (playtest-busy? p))))
   (test "a stale answer while idle changes nothing but the message"
     (let ((p (fresh 'web)))
