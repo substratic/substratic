@@ -9,7 +9,7 @@
 
 (package
   name: "substratic"
-  version: "0.2.1"
+  version: "0.2.2"
   sigil: "0.22.7"
   description: "A small game engine for Sigil, on the desktop and the web"
   url: "https://github.com/substratic/substratic"

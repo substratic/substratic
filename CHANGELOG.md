@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 (2026-09-26)
 
 - `substratic.js`: the fullscreen button draws its icon as inline SVG. It
   was the character U+26F6, which many fonts lack, so browsers without
