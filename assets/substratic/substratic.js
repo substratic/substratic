@@ -84,7 +84,7 @@
     "#sub-note button{font:14px ui-monospace,monospace;margin-right:8px;padding:4px 10px}" +
     "#sub-note img{max-width:100%;max-height:30vh;display:block;margin-bottom:6px;image-rendering:pixelated}" +
     "#sub-fs{position:fixed;right:10px;top:10px;z-index:3;width:36px;height:36px;border-radius:6px;border:1px solid rgba(220,235,255,.35);" +
-    "background:rgba(10,12,20,.45);color:rgba(220,235,255,.8);font:18px sans-serif;opacity:.6}";
+    "background:rgba(10,12,20,.45);color:rgba(220,235,255,.8);padding:0;display:flex;align-items:center;justify-content:center;opacity:.6}";
   document.head.appendChild(css);
 
   // ---- params: all of them, in order -------------------------------------------
@@ -235,9 +235,34 @@
   }
 
   // ---- fullscreen -------------------------------------------------------------------
+  // The icon is inline SVG in the button's text colour, not a font glyph: a
+  // symbol such as U+26F6 exists only in some fonts, and without one the
+  // button shows a missing-glyph box. Four corners point out to enter
+  // fullscreen and in to leave it.
+  var FS_ENTER = "M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5";
+  var FS_EXIT = "M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5";
+  function fsIcon(d) {
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("width", "20"); svg.setAttribute("height", "20");
+    svg.setAttribute("aria-hidden", "true");
+    var p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d); p.setAttribute("fill", "none"); p.setAttribute("stroke", "currentColor");
+    p.setAttribute("stroke-width", "2"); p.setAttribute("stroke-linecap", "square");
+    svg.appendChild(p);
+    return svg;
+  }
   if (cfg.fullscreen && document.documentElement.requestFullscreen) {
     var fs = document.createElement("button");
-    fs.id = "sub-fs"; fs.textContent = "⛶"; fs.title = "Fullscreen";
+    fs.id = "sub-fs";
+    var fsShow = function () {
+      var on = !!document.fullscreenElement;
+      fs.replaceChildren(fsIcon(on ? FS_EXIT : FS_ENTER));
+      fs.title = on ? "Leave fullscreen" : "Fullscreen";
+      fs.setAttribute("aria-label", fs.title);
+    };
+    fsShow();
+    document.addEventListener("fullscreenchange", fsShow);
     fs.addEventListener("click", function () {
       if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(function () {});
     });

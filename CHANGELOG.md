@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `substratic.js`: the fullscreen button draws its icon as inline SVG. It
+  was the character U+26F6, which many fonts lack, so browsers without
+  one showed a missing-glyph box. It now shows four corners pointing out,
+  and pointing in while the page is fullscreen.
 - Substratic's own lock and the examples' locks are on Sigil 0.22.8. The
   package still asks for Sigil 0.22.7 or later, so games on 0.22.7 are
   unaffected.
