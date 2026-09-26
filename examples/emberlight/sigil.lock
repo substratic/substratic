@@ -3,21 +3,21 @@
   (package name: "sigil-stdlib"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7, <1.0"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-stdlib"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-test"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-test"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-test-runner"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-test-runner"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-desktop"
            url: "codeberg:sigil/sigil-desktop"
            ref: "^0.13.0"
@@ -31,27 +31,27 @@
   (package name: "sigil-wasm-runtime"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-wasm-runtime"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-lib"
            url: "codeberg:sigil/sigil"
            ref: ">=0.21"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-lib"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-wasm-gles3"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-wasm-gles3"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-browser"
            url: "codeberg:sigil/sigil"
            ref: ">=0.22.7"
-           sha: "2a9065f277a6210627ca64a9abbcfa5dc8f58c7b"
+           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
            package-selector: "sigil-browser"
-           version: "0.22.7")
+           version: "0.22.8")
   (package name: "sigil-json"
            url: "codeberg:sigil/sigil-json"
            ref: "^0.16.0"

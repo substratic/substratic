@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Substratic's own lock and the examples' locks are on Sigil 0.22.8. The
+  package still asks for Sigil 0.22.7 or later, so games on 0.22.7 are
+  unaffected.
+
 ## 0.2.1 (2026-09-26)
 
 - sigil-graphics `>=0.12.0, <0.14.0` (was `^0.12.0`): a game can take
