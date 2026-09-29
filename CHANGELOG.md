@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3 (2026-09-29)
+
+- `substratic.js`: a browser without WebGL 2 no longer gets the loader's
+  "Failed to start: sigil_wasm_start failed (rc -1)". Before the wasm boots,
+  a throwaway canvas is asked for WebGL 2; without it the game is not
+  started (the wasm is never fetched) and a message says why, what to turn
+  on, and links get.webgl.org/webgl2. It tells WebGL off entirely from WebGL
+  1 only. A start that still fails for want of a context shows the same
+  message in place of the raw error. On by default: `webglCheck: false` in
+  `window.SUBSTRATIC` turns it off, `webglText` changes its wording, and
+  `SubstraticPage.webgl` says what was found. substratic.js must come
+  before the build's app marker, as the template has it.
+- `examples/emberlight/verify-webgl.mjs` checks it in headless Chrome.
+
 ## 0.2.2 (2026-09-26)
 
 - `substratic.js`: the fullscreen button draws its icon as inline SVG. It
