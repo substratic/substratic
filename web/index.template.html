@@ -7,9 +7,11 @@
   It forwards EVERY URL parameter to the game (("params", QUERY), then
   ("param", "KEY=VALUE") for each), with no list to keep in step with the
   game. The rest is assets/substratic/substratic.js: touch sticks, buttons,
-  focus, the version.json check, the playtest report's browser half and a
-  fullscreen button. The build copies it into build/web/assets/substratic/
-  because substratic is a dependency.
+  focus, the version.json check, the playtest report's browser half, a
+  fullscreen button, and the WebGL 2 check (so its tag must stay before the
+  build's app marker: without WebGL 2 it keeps the loader from running).
+  The build copies it into build/web/assets/substratic/ because substratic
+  is a dependency.
 
   __TITLE__ and __VERSION__ are for the game's build step to stamp.
 -->
@@ -47,7 +49,8 @@
     reportUrl: "playtest-report",
     versionUrl: "version.json",
     fullscreen: true,
-    gamepad: true
+    gamepad: true,
+    webglCheck: true            // no WebGL 2: the game is not started, and a message says what to do
   };
   </script>
   <script src="assets/substratic/substratic.js"></script>
