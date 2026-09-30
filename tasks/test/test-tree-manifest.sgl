@@ -1,0 +1,119 @@
+;;; test-tree-manifest SH-ORIGINAL [TREE ...] - the Sigil tree-manifest
+;;; against a game's sh scripts/tree-manifest, on the same inputs.
+;;;
+;;;   sigil tasks/test/test-tree-manifest.sgl GAME/scripts/tree-manifest \
+;;;         ~/…/build/remote-web-<sha>
+;;;
+;;; SH-ORIGINAL's repo is the ROOT for the real TREEs (its functions/ and
+;;; wrangler.jsonc). Synthetic trees cover names and shapes the real ones
+;;; lack. Every refusal both scripts share is checked on both: exit 1 and
+;;; nothing on stdout. TASKS=<dir> runs another copy of tasks/ (sabotage runs).
+;;; Last line is VERDICT; exit 0 only if every check passed.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+(define new-tool (path tasks-dir "tree-manifest.sgl"))
+(define args (script-args))
+(when (null? args)
+  (eprintln "usage: test-tree-manifest.sgl SH-ORIGINAL [TREE ...]")
+  (exit 2))
+(define sh-tool (realpath (car args)))
+(define sh-root (realpath (path (dirname sh-tool) "..")))
+(unless (file? new-tool) (eprintln "SETUP-FAILED: ~a missing" new-tool) (exit 2))
+(unless (file? (path sh-root "wrangler.jsonc"))
+  (eprintln "SETUP-FAILED: ~a has no wrangler.jsonc (is ~a a game's tree-manifest?)" sh-root sh-tool)
+  (exit 2))
+(println "new: ~a" new-tool)
+(println "old: ~a" sh-tool)
+
+(define n 0)
+(define failed 0)
+(define (check name ok detail)
+  (set! n (+ n 1))
+  (if ok
+      (println "PASS ~a" name)
+      (begin (set! failed (+ failed 1))
+             (println "FAIL ~a~a" name (if detail (str ": " detail) "")))))
+
+;; run from a neutral directory: a task run inside a project needs that
+;; project's deps installed, which is not what this test is about
+(define (run-new dir root) ($? sigil ,new-tool ,dir ,root cwd: "/tmp"))
+(define (run-old dir root) ($? sh ,sh-tool ,dir ,root cwd: "/tmp"))
+
+(define (same name dir root)
+  (let ((a (run-new dir root)) (b (run-old dir root)))
+    (check (str name ": both exit 0") (and (ok? a) (ok? b))
+           (str "new " (exit-status a) " " (trim (stderr-of a)) "; old " (exit-status b) " " (trim (stderr-of b))))
+    (check (str name ": byte-identical output ("
+                (length (filter (lambda (l) (not (equal? l ""))) (split (stdout-of b) "\n"))) " lines)")
+           (and (> (string-length (stdout-of b)) 0) (equal? (stdout-of a) (stdout-of b)))
+           "outputs differ")))
+
+(define (both-refuse name dir root)
+  (let ((a (run-new dir root)) (b (run-old dir root)))
+    (check (str name ": both refuse, exit 1, nothing on stdout")
+           (and (equal? (exit-status a) 1) (equal? (exit-status b) 1)
+                (equal? (stdout-of a) "") (equal? (stdout-of b) ""))
+           (str "new rc " (exit-status a) " out " (string-length (stdout-of a))
+                "; old rc " (exit-status b) " out " (string-length (stdout-of b))))
+    (check (str name ": the new one says REFUSED or names the problem")
+           (> (string-length (stderr-of a)) 0) #f)))
+
+;; ---- the real trees
+(each tree (cdr args)
+  (same (str "real tree " (basename tree)) (realpath tree) sh-root))
+
+;; ---- synthetic trees
+(with-temp-dir work
+  (define (mk rel content)
+    (ensure-directory (dirname (path work rel)))
+    (write-text (path work rel) content))
+  ;; a root with a function and a wrangler.jsonc
+  (mk "root/functions/w/[[path]].js" "export const onRequestGet = () => new Response(\"x\");\n")
+  (mk "root/functions/a/b.js" "// nothing imported\nconst x = 1;\n")
+  (mk "root/wrangler.jsonc" "{ \"name\": \"t\" }\n")
+  (define root (path work "root"))
+  ;; names that sort differently in naive orders: - . / _ uppercase, dotfiles,
+  ;; spaces, non-ASCII, an empty file, an empty directory
+  (for-each (lambda (f) (mk (str "t1/" f) (str "content of " f "\n")))
+            '("a-b" "a.b" "a/b" "aZ" "a_" "z" "é.txt" ".hidden" ".d/x" "sp ace/f g.txt"
+              "deep/er/still/deeper/leaf.bin" "B" "b" "0" "_headers"))
+  (mk "t1/empty" "")
+  (ensure-directory (path work "t1/empty-dir"))
+  (same "synthetic names" (path work "t1") root)
+
+  ;; ---- refusals both share
+  (mk "t2/index.html" "x")
+  ($ ln -s index.html ,(path work "t2/link.html"))
+  (both-refuse "a symlink in the tree" (path work "t2") root)
+
+  (mk "t3/index.html" "x")
+  (mk "r3/wrangler.jsonc" "{}")
+  (mk "r3/functions/w/ok.js" "x")
+  ($ ln -s ok.js ,(path work "r3/functions/w/l.js"))
+  (both-refuse "a symlink in functions/" (path work "t3") (path work "r3"))
+
+  (each form '("import x from \"./y.js\";" "  import { a } from 'b'" "const m = require(\"m\");" "const m = await import(\"m\");" "import(\"x\")")
+    (let ((r (path work (str "ri-" (string-length form)))))
+      (mk (str "ri-" (string-length form) "/wrangler.jsonc") "{}")
+      (mk (str "ri-" (string-length form) "/functions/w/f.js") (str "// a function\n" form "\n"))
+      (both-refuse (str "a Function that imports: " form) (path work "t3") r)))
+
+  (mk "r4/wrangler.jsonc" "{}")
+  (both-refuse "no functions/" (path work "t3") (path work "r4"))
+  (mk "r5/functions/w/f.js" "x")
+  (both-refuse "no wrangler.jsonc" (path work "t3") (path work "r5"))
+
+  ;; a positive control for the import check: the word "import" in a comment
+  ;; or a string that is not an import statement passes both
+  (mk "r6/wrangler.jsonc" "{}")
+  (mk "r6/functions/w/f.js" "// we never import anything here\nconst s = \"important\";\n")
+  (same "the word import that is not an import" (path work "t3") (path work "r6"))
+
+  ;; ---- where the new one is deliberately stricter
+  (mk "t7/index.html" "x")
+  (mk "t7/back\\slash.txt" "x")
+  (let ((a (run-new (path work "t7") root)))
+    (check "a backslash in a name: the new one refuses (sha256sum would escape it)"
+           (and (equal? (exit-status a) 1) (equal? (stdout-of a) "")) (exit-status a))))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

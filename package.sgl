@@ -10,7 +10,7 @@
 (package
   name: "substratic"
   version: "0.2.3"
-  sigil: "0.22.7"
+  sigil: "0.22.11"
   description: "A small game engine for Sigil, on the desktop and the web"
   url: "https://github.com/substratic/substratic"
   license: "BSD-3-Clause"
@@ -46,7 +46,7 @@
     ;; Web only: localStorage for (substratic store kv). A game on the web
     ;; lists it too (a dependency's own dependencies are not compiled into
     ;; the game's bundle unless the game lists them, sigil 0.22.7).
-    (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.7" configs: '(web)))
+    (from-git url: sigil-repo package: "sigil-browser" version: ">=0.22.11" configs: '(web)))
 
   ;; (substratic image capture): glReadPixels through sigil-desktop's GL proc
   ;; loader natively; (substratic input pad): GLFW's gamepad state. Stubs
@@ -57,9 +57,71 @@
       c-sources: '("src/c/capture.c" "src/c/pad.c" "src/c/natives.c")
       native-init: "sigil__init_substratic_natives"))
 
+  ;; The games' shared site tooling: script tasks in tasks/ (outside src/, so
+  ;; no build compiles them into a game), run as `sgx substratic:<name>`
+  ;; (sigil task, 0.22.11) or by path before that. Each game configures them
+  ;; in its substratic.sgv. tasks/README.md has the whole path.
+  provides: (list
+    script-tasks: '((build-remote
+                     file: "tasks/build-remote.sgl"
+                     description: "Build HEAD's web config on a remote runner and fetch it to build/remote-web-<sha>"
+                     usage: "[--test FILE] [--no-web] [--no-fetch] [--release] [--command \"ARGS\"] [--output PATH]")
+                    (stage-web
+                     file: "tasks/stage-web.sgl"
+                     description: "Stage the site and the app into DIR, generate DIR.pages, write DIR.manifest"
+                     usage: "DIR")
+                    (check-site
+                     file: "tasks/check-site.sgl"
+                     description: "The local gate: serve DIR on loopback, run the shared legs and the game's arm, write DIR.verified"
+                     usage: "DIR")
+                    (publish-web
+                     file: "tasks/publish-web.sgl"
+                     description: "Publish exactly the checked tree: R2, then preview, verify-live, production"
+                     usage: "DIR \"<one line>\" [--preview | --dry-run]")
+                    (verify-live
+                     file: "tasks/verify-live.sgl"
+                     description: "Check a deployment against the staged tree it was published from"
+                     usage: "URL DIR [--wrangler-dev]")
+                    (pages-dev-check
+                     file: "tasks/pages-dev-check.sgl"
+                     description: "Run DIR through wrangler pages dev with a local R2 bucket and verify-live it"
+                     usage: "DIR [PORT]")
+                    (tree-manifest
+                     file: "tasks/tree-manifest.sgl"
+                     description: "Print a deploy's identity: every file's sha256, then the Functions and wrangler config"
+                     usage: "DIR [ROOT]")
+                    (r2-s3
+                     file: "tasks/r2-s3.sgl"
+                     description: "Read or write one R2 object through R2's S3 API (never deletes)"
+                     usage: "head BUCKET KEY | get BUCKET KEY FILE | put BUCKET KEY FILE TYPE [CACHE-CONTROL]")
+                    (cloudflare-setup
+                     file: "tasks/cloudflare-setup.sgl"
+                     description: "Report, or create the Pages project and bucket, or attach the domains (the account owner runs it)"
+                     usage: "[--create | --domain]")
+                    (host-site
+                     file: "tasks/host-site.sgl"
+                     description: "Serve a staged tree on a private interface through serve-site.mjs, or stop it"
+                     usage: "DIR | --stop")
+                    (check-linux-binary
+                     file: "tasks/check-linux-binary.sgl"
+                     description: "Does a Linux executable start on ordinary distributions? (interpreter, libraries, glibc floor)"
+                     usage: "FILE")
+                    (make-portable
+                     file: "tasks/make-portable.sgl"
+                     description: "Copy a Linux executable with the standard /lib64 interpreter (patchelf), then check it"
+                     usage: "IN OUT")
+                    (smoke-ubuntu
+                     file: "tasks/smoke-ubuntu.sgl"
+                     description: "Run a command from an unpacked release in a stock Ubuntu 22.04 userland, headless, no root"
+                     usage: "DIR [--negative FILE] -- COMMAND [ARGS...]")
+                    (distro-play
+                     file: "tasks/distro-play.sgl"
+                     description: "Play a Linux release archive in a stock Ubuntu, Fedora, Debian or Arch userland (docker)"
+                     usage: "ubuntu|fedora|debian|arch ARCHIVE [BINARY] [ARGS...]")))
+
   dev-dependencies: (list
-    (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.7")
-    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.7")
+    (from-git url: sigil-repo package: "sigil-test" version: ">=0.22.11")
+    (from-git url: sigil-repo package: "sigil-test-runner" version: ">=0.22.11")
     ;; the tests check (substratic data json)'s output with an independent decoder
     (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0"))
 

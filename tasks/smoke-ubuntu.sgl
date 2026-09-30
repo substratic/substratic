@@ -1,0 +1,101 @@
+;;; smoke-ubuntu DIR [--negative FILE] -- COMMAND [ARGS...] - run a command
+;;; from an unpacked release in a stock Ubuntu 22.04 userland, headless, with
+;;; no root: the games' release-archive smoke leg, for any game.
+;;;
+;;;   sgx substratic:smoke-ubuntu dist/game-v1 --negative build/release/bin/game \
+;;;       -- bin/game --bench-probe 3
+;;;
+;;; The userland is ubuntu-base 22.04.5 (amd64), pinned by sha256 and cached
+;;; under $XDG_CACHE_HOME/substratic/ (downloaded once from
+;;; cdimage.ubuntu.com). A scratch copy of it gets DIR at /game; COMMAND runs
+;;; there with cwd /game, PATH=/usr/bin:/bin, HOME=/tmp, /proc mounted, in a
+;;; fresh user, mount, pid and network namespace (unshare -r -m -p -f -n, then chroot),
+;;; bounded at 300 s. Its arguments are passed as they are, never through a
+;;; shell string. Its stdout comes out on stdout (for the game's own gate to
+;;; compare), its stderr on stderr, and this task exits with its status.
+;;;
+;;; --negative FILE: FILE (the build's own, unpatched executable) is copied
+;;; in and run first; it must FAIL TO START (exit 127, "No such file"), the
+;;; proof that the userland is really not the build machine's. If it starts,
+;;; or fails any other way, this exits 1 before COMMAND runs.
+;;; Exit: COMMAND's status; 1 the negative started; 125 SETUP-FAILED (no
+;;; unprivileged user namespaces, no userland, a bad argument).
+(requires (tools unshare chroot tar curl sha256sum cp))
+(define ub-name "ubuntu-base-22.04.5-base-amd64.tar.gz")
+(define ub-url (str "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/" ub-name))
+(define ub-sha "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a")
+(define (setup fmt . xs) (eprintln "smoke-ubuntu: SETUP-FAILED: ~a" (apply format (cons fmt xs))) (exit 125))
+
+;; ---- arguments: DIR [--negative FILE] -- COMMAND...
+(define args (script-args))
+(define dd (member "--" args))
+(unless (and dd (pair? (cdr dd))) (setup "usage: smoke-ubuntu DIR [--negative FILE] -- COMMAND [ARGS...]"))
+(define before (let loop ((xs args) (acc '())) (if (equal? (car xs) "--") (reverse acc) (loop (cdr xs) (cons (car xs) acc)))))
+(define command (cdr dd))
+(define dir (and (pair? before) (car before)))
+(define negative (cond ((equal? (cdr before) '()) #f)
+                       ((and (= (length (cdr before)) 2) (equal? (cadr before) "--negative")) (caddr before))
+                       (else (setup "unknown arguments before --: ~a" (string-join (cdr before) " ")))))
+(unless (and dir (directory? dir)) (setup "~a is not a directory (the unpacked release)" dir))
+(when (and negative (not (file? negative))) (setup "--negative ~a is not a file" negative))
+
+;; ---- the userland
+(define cache (path (or (getenv "XDG_CACHE_HOME") (path (getenv "HOME") ".cache")) "substratic"))
+(define ub (path cache ub-name))
+(ensure-directory cache)
+(define (ub-ok?) (and (file? ub) (equal? (car (split (out sha256sum ,ub) " ")) ub-sha)))
+(unless (ub-ok?)
+  (eprintln "smoke-ubuntu: fetching ~a (once)" ub-url)
+  (let ((r ($? curl -sSfL -o ,(str ub ".part") ,ub-url timeout: 600)))
+    (when (ok? r) ($ mv ,(str ub ".part") ,ub))))
+(unless (ub-ok?) (setup "no ~a with sha256 ~a in ~a" ub-name ub-sha cache))
+(unless (ok? ($? unshare -r true)) (setup "no unprivileged user namespaces (unshare -r)"))
+
+;; inside the temp scope, leave by raising: `exit' there would skip its
+;; cleanup and leak the unpacked userland (the adversarial review, 2026-09-29)
+(define (leave n) (raise (cons 'smoke-leave n)))
+(define (setup! fmt . xs) (eprintln "smoke-ubuntu: SETUP-FAILED: ~a" (apply format (cons fmt xs))) (leave 125))
+
+(define (run-smoke)
+  (with-temp-dir w
+    (let ((root (path w "rootfs")))
+      (ensure-directory root)
+      ;; device nodes cannot be made unprivileged; tar says so and goes on
+      ($? tar -xzf ,ub -C ,root)
+      (unless (file? (path root "etc" "os-release")) (setup! "the userland did not unpack"))
+      (ensure-directory (path root "game"))
+      ($ cp -a ,(str dir "/.") ,(str (path root "game") "/"))
+      ;; argv reaches the chroot's sh as "$@", never re-parsed. The status is
+      ;; written INSIDE the chroot: no status file means the plumbing (unshare,
+      ;; chroot, the /proc mount) failed, which is a setup failure, never the
+      ;; game's. A fresh network namespace: the game has no network. timeout -k
+      ;; kills a game that ignores TERM.
+      (define (inside argv out-file err-file)
+        (let ((rcf (path root "tmp" ".smoke-rc")))
+          (when (file-exists? rcf) (delete-file rcf))
+          ($? unshare -r -m -p -f -n chroot ,root /usr/bin/env -i "PATH=/usr/bin:/bin" "HOME=/tmp"
+              /bin/sh -c "mount -t proc proc /proc && cd /game && { timeout -k 10 300 \"$@\"; echo $? > /tmp/.smoke-rc; }" sh ,@argv
+              out: ,out-file err: ,err-file timeout: 330)
+          (let ((t (read-text rcf missing: #f trim: #t)))
+            (unless (and t (regex-match? "[0-9]+" t))
+              (setup! "the command did not run inside the userland (~a)"
+                      (trim (read-text err-file missing: ""))))
+            (string->number t))))
+      (let ((os (let ((m (regex-search "(?m)^PRETTY_NAME=\"?([^\"\n]*)" (read-text (path root "etc" "os-release"))))) (if m (match-group m 1) "?"))))
+        (eprintln "smoke-ubuntu: ~a" os))
+      (when negative
+        ($ cp ,negative ,(path root "game" ".unpatched-build"))
+        (let* ((rc (inside (list "./.unpatched-build") (path w "neg.out") (path w "neg.err")))
+               (err (read-text (path w "neg.err") missing: "")))
+          (unless (and (equal? rc 127) (contains? err "No such file"))
+            (eprintln "smoke-ubuntu: FAIL the unpatched build did not fail to start as expected (rc ~a: ~a)"
+                      rc (car (append (split err "\n") (list ""))))
+            (leave 1))
+          (eprintln "smoke-ubuntu: the unpatched build does not start here (rc 127: ~a)" (car (split err "\n")))))
+      (let ((rc (inside command (path w "cmd.out") (path w "cmd.err"))))
+        (display (read-text (path w "cmd.out") missing: ""))
+        (let ((e (read-text (path w "cmd.err") missing: ""))) (unless (equal? e "") (eprintln "~a" (trim e))))
+        (eprintln "smoke-ubuntu: rc ~a" rc)
+        rc))))
+
+(exit (guard (e ((and (pair? e) (eq? (car e) 'smoke-leave)) (cdr e))) (run-smoke)))

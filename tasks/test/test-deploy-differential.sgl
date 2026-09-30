@@ -1,0 +1,162 @@
+;;; test-deploy-differential GAME-ROOT WEB-BUILD - what a game's own sh
+;;; publish path would deploy against what these tasks would, from the same
+;;; commit and the same web build. No network, no token, nothing deployed.
+;;;
+;;;   sigil tasks/test/test-deploy-differential.sgl GAME-CHECKOUT \
+;;;         ~/…/build/remote-web-<sha>
+;;;
+;;; GAME-ROOT is a clean checkout with substratic.sgv and the game's sh
+;;; scripts (scripts/stage-web, scripts/check-site.mjs, scripts/publish-web,
+;;; scripts/r2-s3). Both paths run for real, each end to end:
+;;;
+;;;   old: scripts/stage-web; node scripts/check-site.mjs; scripts/publish-web --preview
+;;;   new: stage-web; check-site; publish-web --preview   (these tasks)
+;;;
+;;; against the R2 mock (test/r2-s3-mock.cjs) and a stub `wrangler` that
+;;; copies the directory it was asked to deploy and fails. Then it compares
+;;; the two deploys: the tree (byte for byte), wrangler.json (byte for byte),
+;;; the Function (its code byte for byte; its comments are reported), the
+;;; wrangler arguments, and the R2 object each put (key, type and bytes).
+;;; Last line is VERDICT; exit 0 only if every check passed.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+;; load.sgl resolves against the running script's directory (tasks/), so
+;; a test loads the libraries it needs itself
+(each lib (list "common" "config") (load (path tasks-dir "substratic" "tasks" (str lib ".sgl"))))
+(import (substratic tasks config))
+(define args (script-args))
+(unless (= (length args) 2)
+  (eprintln "usage: test-deploy-differential.sgl GAME-ROOT WEB-BUILD") (exit 2))
+(define game (realpath (car args)))
+(define web (realpath (cadr args)))
+(define token "tok-differential-QQ7")
+(define account "acct-diff")
+(define n 0)
+(define failed 0)
+(define (check name ok detail)
+  (set! n (+ n 1))
+  (if ok (println "PASS ~a" name)
+      (begin (set! failed (+ failed 1)) (println "FAIL ~a~a" name (if detail (str ": " detail) "")))))
+(define (setup-failed why) (println "SETUP-FAILED: ~a" why) (exit 2))
+
+(unless (and game web) (setup-failed "GAME-ROOT or WEB-BUILD does not exist"))
+(unless (equal? "" (out git status --porcelain "--untracked-files=no" cwd: ,game))
+  (setup-failed "GAME-ROOT has tracked changes; both publish paths would refuse"))
+(define config (read-config game))
+(define app (publish-app config))
+(define web-env (or (cdr (assoc "web-env" app)) (setup-failed "the app has no web: env: to point at WEB-BUILD")))
+(define bucket (cfg config "publish" "wasm" "bucket"))
+(define old-dir "build/diff-old")
+(define new-dir "build/diff-new")
+(each d (list old-dir new-dir)
+  (each suffix '("" ".manifest" ".verified" ".pages")
+    ($ rm -rf ,(path game (str d suffix)))))
+
+(define work (make-temp-directory))
+(define bin (path work "bin"))
+(ensure-directory bin)
+(write-text (path bin "wrangler")
+            (str "#!/bin/sh\n"
+                 "echo \"$*\" > \"$STUB_DIR/argv-$STUB_RUN\"\n"
+                 "mkdir -p \"$STUB_DIR/capture-$STUB_RUN\" && cp -a . \"$STUB_DIR/capture-$STUB_RUN/\"\n"
+                 "echo 'stub wrangler: refusing to deploy' >&2\nexit 1\n"))
+($ chmod +x ,(path bin "wrangler"))
+(define mock #f)
+(define port #f)
+(define (start-mock)
+  (when mock (when (process-alive? mock) (process-kill! mock)) (process-wait mock))
+  (when (file-exists? (path work "mock.log")) (delete-file (path work "mock.log")))
+  (set! mock (spawn node ,(path tasks-dir "test" "r2-s3-mock.cjs") 0 ,token ,bucket out: ,(path work "mock.log") err: 'merge))
+  (wait-until (and (file? (path work "mock.log")) (contains? (read-text (path work "mock.log")) "listening"))
+              timeout: 10 interval: 0.1 message: "the R2 mock did not start")
+  (set! port (car (split (cadr (split (read-text (path work "mock.log")) "listening ")) " "))))
+(define (env run)
+  (list (cons "PATH" (str bin ":" (getenv "PATH"))) (cons "STUB_DIR" work) (cons "STUB_RUN" run)
+        (cons web-env web)
+        (cons "CLOUDFLARE_API_TOKEN" token) (cons "CLOUDFLARE_ACCOUNT_ID" account)
+        (cons "R2_API_BASE" (str "http://127.0.0.1:" port)) (cons "R2_S3_ENDPOINT" (str "http://127.0.0.1:" port))))
+(define (run-step name run . argv)
+  (let ((r ($? ,@argv cwd: ,game env: ,(env run) err: 'merge timeout: 900)))
+    (write-text (path work (str "log-" run "-" name)) (stdout-of r))
+    r))
+(define (stored-object run)
+  ;; the object R2 holds after RUN, read back through the mock
+  (let ((f (path work (str "object-" run))))
+    ($ sigil ,(path tasks-dir "r2-s3.sgl") get ,bucket ,(key-of run) ,f cwd: "/tmp" env: ,(env run))
+    f))
+(define (key-of run)
+  (let ((m (regex-search "(?m)^PUT /[a-z0-9-]+/(\\S+) -> 200" (read-text (path work (str "mock-" run ".log"))))))
+    (and m (match-group m 1))))
+(define (strip-comments file)
+  (string-join (filter (lambda (l) (not (starts-with? (trim l) "//"))) (split (read-text file) "\n")) "\n"))
+
+(define (last-lines s)
+  (let ((ls (filter (lambda (l) (not (equal? l ""))) (split s "\n"))))
+    (string-join (if (> (length ls) 6) (list-tail ls (- (length ls) 6)) ls) " | ")))
+(define old-object #f)
+(define new-object #f)
+
+(dynamic-wind
+  (lambda () #f)
+  (lambda ()
+    ;; ---- old
+    (start-mock)
+    (let ((s (run-step "stage" "old" "sh" "scripts/stage-web" old-dir)))
+      (check "old: scripts/stage-web" (ok? s) (stdout-of s)))
+    (let ((c (run-step "check" "old" "node" "scripts/check-site.mjs" old-dir)))
+      (check "old: scripts/check-site.mjs GREEN" (ok? c) (last-lines (stdout-of c))))
+    (let ((p (run-step "publish" "old" "sh" "scripts/publish-web" old-dir "differential" "--preview")))
+      (check "old: scripts/publish-web put the wasm and reached the (stub) deploy"
+             (and (contains? (stdout-of p) "(read back, identical)") (file-exists? (path work "capture-old")))
+             (last-lines (stdout-of p))))
+    ($ cp ,(path work "mock.log") ,(path work "mock-old.log"))
+    (set! old-object (and (key-of "old") (stored-object "old")))
+    ;; ---- new
+    (start-mock)
+    (let ((s (run-step "stage" "new" "sigil" (path tasks-dir "stage-web.sgl") new-dir)))
+      (check "new: stage-web" (ok? s) (stdout-of s)))
+    (let ((c (run-step "check" "new" "sigil" (path tasks-dir "check-site.sgl") new-dir)))
+      (check "new: check-site GREEN" (ok? c) (last-lines (stdout-of c))))
+    (let ((p (run-step "publish" "new" "sigil" (path tasks-dir "publish-web.sgl") new-dir "differential" "--preview")))
+      (check "new: publish-web put the wasm and reached the (stub) deploy"
+             (and (contains? (stdout-of p) "read back, identical") (file-exists? (path work "capture-new")))
+             (last-lines (stdout-of p))))
+    ($ cp ,(path work "mock.log") ,(path work "mock-new.log"))
+    (set! new-object (and (key-of "new") (stored-object "new")))
+
+    ;; ---- the comparison (only when both sides reached the deploy: comparing
+    ;; nothing would pass or crash, never measure)
+    (unless (and (file-exists? (path work "capture-old")) (file-exists? (path work "capture-new")))
+      (println "SETUP-FAILED: a side never reached the (stub) deploy; nothing to compare (see its FAIL above)")
+      (println "VERDICT: ~a/~a passed" (- n failed) n)
+      (exit 2))
+    (let ((o (path work "capture-old")) (w (path work "capture-new")))
+      (let ((d ($? diff -r ,(path o "tree") ,(path w "tree"))))
+        (check "the deployed trees are byte-identical (diff -r)" (ok? d) (last-lines (stdout-of d))))
+      (check (str "the deployed tree has " (length (lines find ,(path w "tree") -type f)) " files, not an empty match")
+             (> (length (lines find ,(path w "tree") -type f)) 10) #f)
+      (check "wrangler.json is byte-identical" (ok? ($? cmp ,(path o "wrangler.json") ,(path w "wrangler.json"))) #f)
+      (let ((of (lines find ,(path o "functions") -type f)) (nf (lines find ,(path w "functions") -type f)))
+        (check "the same Function files" (equal? (map (lambda (f) (substring f (string-length o) (string-length f))) of)
+                                                 (map (lambda (f) (substring f (string-length w) (string-length f))) nf))
+               (str of " vs " nf))
+        (each f of
+          (let ((g (str w (substring f (string-length o) (string-length f)))))
+            (check (str "the Function's code is byte-identical, comments aside: " (basename f))
+                   (equal? (strip-comments f) (strip-comments g)) #f)
+            (println "  note: the Function's comments ~a" (if (ok? ($? cmp ,f ,g)) "are identical too" "differ (the generated header)")))))
+      (let ((extra (filter (lambda (f) (not (file-exists? (path w f)))) (directory-list o))))
+        (println "  note: only in the old deploy directory: ~a" (if (null? extra) "nothing" (string-join extra " "))))
+      (check "wrangler got the same arguments" (equal? (read-text (path work "argv-old")) (read-text (path work "argv-new")))
+             (str (read-text (path work "argv-old")) " vs " (read-text (path work "argv-new"))))
+      (check "the same R2 key" (and (key-of "old") (equal? (key-of "old") (key-of "new"))) (str (key-of "old") " vs " (key-of "new")))
+      (check "the same R2 content-type"
+             (let ((t (lambda (run) (let ((m (regex-search "stored-type \\S+ (\\S+)" (read-text (path work (str "mock-" run ".log")))))) (and m (match-group m 1))))))
+               (and (t "old") (equal? (t "old") (t "new"))))
+             #f)
+      (check "the same R2 object bytes" (and old-object new-object (ok? ($? cmp ,old-object ,new-object))) #f)))
+  (lambda ()
+    (when mock (when (process-alive? mock) (process-kill! mock)) (process-wait mock))
+    (eprintln "test-deploy-differential: evidence in ~a" work)))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

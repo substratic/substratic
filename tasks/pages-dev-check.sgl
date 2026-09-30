@@ -1,0 +1,144 @@
+;;; pages-dev-check DIR [PORT] - run a staged tree through Cloudflare's own
+;;; Pages runtime on this machine, with the wasm in a LOCAL R2 bucket, and
+;;; check it with verify-live: the closest thing to a deployment that needs
+;;; no Cloudflare account. Ported from the games' sh scripts. Default port 8819.
+;;;
+;;;   sgx substratic:pages-dev-check build/site
+;;;
+;;; What it proves that check-site cannot: the generated Pages Function
+;;; (DIR.pages/functions/<route>/[[path]].js) serves the wasm from an R2
+;;; binding named as wrangler.json names it, byte for byte, with CORP/COEP
+;;; and an immutable cache; the tree's _headers is applied by Pages' own
+;;; code; a missing path answers the 404 page. It does this exactly as
+;;; publish-web will: a copy of DIR with the wasm removed and put in R2 under
+;;; the key the page names. What it cannot prove: the real R2 upload, the
+;;; token's scopes, Cloudflare's edge (compression, caching), the domain.
+;;;
+;;; workerd, the runtime wrangler starts, is a glibc binary that expects
+;;; /lib64/ld-linux-x86-64.so.2, which Guix does not have; this runs it
+;;; through Guix's glibc loader via a wrapper named by MINIFLARE_WORKERD_PATH
+;;; (a Guix system has no /lib64 loader). wrangler's state goes to the scratch
+;;; copy, and its HOME to an empty directory there, never the repo or ~.
+;;; The binding check is an exact match (env.WASMX must not pass for WASM).
+;;; Exit: verify-live's code; 1 when the tree no longer matches its
+;;; manifest; 2 SETUP-FAILED (wrangler, workerd, the loader, the server).
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks config) (substratic tasks manifest))
+(requires (tools wrangler node guix cp kill chmod find))
+(set-task-name! "pages-dev-check")
+
+(define tasks-dir (realpath (script-dir)))
+(define args (script-args))
+(unless (and (>= (length args) 1) (<= (length args) 2)) (usage-error "usage: pages-dev-check DIR [PORT]"))
+(define port (if (= (length args) 2) (cadr args) "8819"))
+(unless (regex-match? "[0-9]{4,5}" port) (usage-error "PORT must be a number"))
+
+;; PID and every process below it, read from /proc (ppid is stat's 4th
+;; field, after the ")" that ends the command name), children first
+(define (kill-tree pid)
+  (let* ((procs (filter (lambda (n) (regex-match? "[0-9]+" n)) (or (directory-list "/proc") '())))
+         (ppid-of (lambda (n)
+                    (let* ((st (guard (e (#t #f)) (read-text (path "/proc" n "stat"))))
+                           (m (and st (regex-search "\\) \\S+ ([0-9]+)" st))))
+                      (and m (string->number (match-group m 1))))))
+         (pairs (map (lambda (n) (cons (string->number n) (ppid-of n))) procs)))
+    (let walk ((p pid))
+      (each c (map car (filter (lambda (x) (equal? (cdr x) p)) pairs)) (walk c))
+      ($? kill -TERM ,(number->string p)))))
+
+(define (regex-quote s) (regex-replace-all "[\\\\.+*?()|\\[\\]{}^$]" s "\\\\$0"))
+
+(define (main)
+  (let* ((root (project-dir))
+         (config (read-config root))
+         (app (publish-app config))
+         (name (cdr (assoc "name" app)))
+         (route (cfg config "publish" "wasm" "route"))
+         (bucket (cfg config "publish" "wasm" "bucket"))
+         (binding (cfg config "publish" "wasm" "binding"))
+         (arg (car args))
+         (dir (realpath (if (starts-with? arg "/") arg (path (current-directory) arg))))
+         (pages (and dir (str dir ".pages"))))
+    (unless (and dir (file? (path dir "index.html")) (file? (str dir ".manifest")) (directory? pages))
+      (usage-error "give a staged tree (stage-web DIR): ~a, its .manifest and .pages" arg))
+    (unless (equal? (string-join (tree-manifest dir pages) "\n") (manifest-body (str dir ".manifest")))
+      (refuse "~a no longer matches ~a.manifest; restage" arg arg))
+    (let* ((wrangler-js (realpath (out sh -c "command -v wrangler")))
+           (wdir (dirname wrangler-js))
+           (workerd (let ((p (path wdir ".." "node_modules" "@cloudflare" "workerd-linux-64" "bin" "workerd")))
+                      (if (file? p)
+                          p
+                          (let ((found (lines find ,(path wdir "..") -path "*workerd-linux-64/bin/workerd" -type f)))
+                            (if (pair? found) (car found) (setup-failed! "wrangler's workerd not found"))))))
+           (glibc (let ((ls (filter (lambda (l) (not (or (ends-with? l "-debug") (ends-with? l "-static"))))
+                                    (lines guix build glibc timeout: 600))))
+                    (if (and (pair? ls) (file? (path (car ls) "lib" "ld-linux-x86-64.so.2")))
+                        (car ls)
+                        (setup-failed! "no glibc loader from guix")))))
+      (with-temp-dir w
+        (let ((wrapper (path w "workerd"))
+              (home (path w "home"))
+              (server #f))
+          (write-text wrapper (str "#!/bin/sh\nexec " (path glibc "lib" "ld-linux-x86-64.so.2")
+                                   " --library-path " (path glibc "lib") " " workerd " \"$@\"\n"))
+          ($ chmod +x ,wrapper)
+          (ensure-directory home)
+          (unless (ok? ($? ,wrapper --version)) (setup-failed! "workerd does not run through the loader"))
+          ($ cp -a ,(path pages "functions") ,(path w "functions"))
+          ($ cp ,(path pages "wrangler.json") ,(path w "wrangler.json"))
+          (ensure-directory (path w "tree"))
+          ($ cp -a ,(str dir "/.") ,(str (path w "tree") "/"))
+          (let* ((wasms (filter (lambda (e) (ends-with? (cdr e) ".wasm")) (manifest-entries (str dir ".manifest"))))
+                 (key (if (= (length wasms) 1) (cdar wasms)
+                          (refuse "want one wasm in the tree, found: ~a" (string-join (map cdr wasms) " ")))))
+            (unless (regex-match? (str (regex-quote route) "/[0-9a-f]{16}/" (regex-quote name) "\\.wasm") key)
+              (refuse "the wasm is at ~a, not ~a/<sha16>/~a.wasm" key route name))
+            ($ cp ,(path w "tree" key) ,(path w "the.wasm"))
+            ($ rm -rf ,(path w "tree" route))
+            (let ((env (list (cons "MINIFLARE_WORKERD_PATH" wrapper) (cons "HOME" home) (cons "XDG_CONFIG_HOME" home)
+                             (cons "WRANGLER_SEND_METRICS" "false")
+                             ;; never a real account: this is all local
+                             (cons "CLOUDFLARE_API_TOKEN" "") (cons "CLOUDFLARE_ACCOUNT_ID" ""))))
+              (let ((put ($? wrangler r2 object put ,(str bucket "/" key) --local --file the.wasm
+                             --content-type application/wasm cwd: ,w env: ,env err: 'merge timeout: 120)))
+                (unless (ok? put)
+                  (display (stdout-of put))
+                  (setup-failed! "the local R2 put")))
+              (dynamic-wind
+                (lambda () #f)
+                (lambda ()
+                  ;; in this task's process group (a terminal's Ctrl-C reaches it);
+                  ;; cleanup stops it and every process under it (kill-tree)
+                  (set! server (spawn wrangler pages dev tree --port ,port --ip "127.0.0.1"
+                                      cwd: ,w env: ,env out: ,(path w "dev.log") err: 'merge))
+                  (let loop ((i 0))
+                    (let ((log (if (file? (path w "dev.log")) (read-text (path w "dev.log")) "")))
+                      (cond ((contains? log "Ready on") #t)
+                            ((not (process-alive? server))
+                             (display log) (setup-failed! "wrangler pages dev exited"))
+                            ((>= i 60)
+                             (display log)
+                             (eprintln "pages-dev-check: TIMED-OUT: wrangler pages dev not ready in 60 s")
+                             (task-exit 2))
+                            (else (sleep 1) (loop (+ i 1))))))
+                  (let ((log (read-text (path w "dev.log"))))
+                    ;; the server verify-live will talk to is the one this task
+                    ;; started: wrangler must say it is ready on exactly our port
+                    (unless (contains? log (str "Ready on http://127.0.0.1:" port))
+                      (display log)
+                      (setup-failed! "wrangler is not ready on 127.0.0.1:~a (a port in use? it may have picked another)" port))
+                    (unless (regex-search (str "env\\." binding "([^A-Za-z0-9_]|$)") log)
+                      (display log)
+                      (setup-failed! "the ~a binding is not in wrangler's binding list" binding)))
+                  (say "~a in wrangler pages dev on 127.0.0.1:~a, the wasm in local R2 bucket ~a" arg port bucket)
+                  (let ((v ($? node ,(path tasks-dir "checks" "verify-live.mjs") ,(str "http://127.0.0.1:" port) ,dir
+                               --wrangler-dev timeout: 900)))
+                    (display (stdout-of v))
+                    (say "verify-live rc=~a" (exit-status v))
+                    (or (exit-status v) 2)))
+                (lambda ()
+                  (when (and server (process-alive? server))
+                    (kill-tree (process-pid server))
+                    (process-wait server)))))))))))
+
+(exit (with-refusals main))

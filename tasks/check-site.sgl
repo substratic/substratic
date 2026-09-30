@@ -1,0 +1,96 @@
+;;; check-site DIR - the local gate for a staged site tree.
+;;;
+;;;   sgx substratic:check-site build/site
+;;;
+;;; At the START of the run it hashes every gate file (this task, the shared
+;;; checkers, the libraries they use, the game's arm and its check: gate-files:)
+;;; and reads HEAD and whether the checkout has tracked changes. Then:
+;;;
+;;;   manifest   DIR with DIR.pages still hashes to DIR.manifest
+;;;   the rest   checks/check-site.mjs: the shared legs and the game's arm
+;;;              (check: arm: in substratic.sgv), against DIR served on loopback
+;;;
+;;; All green writes DIR.verified:
+;;;
+;;;   manifest-sha256 <sha256 of DIR.manifest>
+;;;   tools substratic <version> <sha>
+;;;   gate <sha256> <absolute path>        one per gate file
+;;;   gate-head <HEAD>
+;;;   gate-clean yes|no
+;;;   at <UTC time>
+;;;
+;;; publish-web refuses without it, re-hashes every gate file, and refuses
+;;; gate-clean no. Anything but green removes DIR.verified. A dirty checkout
+;;; still goes green here (so a check can be run while working) and says so.
+;;; Exit 0 green, 1 red, 2 setup failed.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks config) (substratic tasks manifest))
+(requires (tools git node date))
+(set-task-name! "check-site")
+
+(define tasks-dir (realpath (script-dir)))
+(define args (script-args))
+(unless (= (length args) 1) (usage-error "usage: check-site DIR"))
+
+;; the shared gate files, by their paths inside substratic
+(define shared-gates
+  (list "check-site.sgl" "checks/check-site.mjs" "checks/serve-site.mjs"
+        "substratic/load.sgl" "substratic/tasks/common.sgl" "substratic/tasks/config.sgl"
+        "substratic/tasks/manifest.sgl"))
+
+(with-refusals
+  (lambda ()
+    (let* ((root (project-dir))
+           (config (read-config root))
+           (arg (let ((d (car args)))
+                  (if (and (> (string-length d) 1) (ends-with? d "/")) (substring d 0 (- (string-length d) 1)) d)))
+           (dir (realpath (if (starts-with? arg "/") arg (path (current-directory) arg))))
+           (verified (str dir ".verified"))
+           (arm (path root (cfg config "publish" "check" "arm")))
+           (gates (append (map (lambda (g) (path tasks-dir g)) shared-gates)
+                          (list arm)
+                          (map (lambda (g) (path root g)) (cfg config "publish" "check" "gate-files")))))
+      (unless dir (setup-failed "~a does not exist (stage-web first)" arg))
+      (when (file-exists? verified) (delete-file verified))
+      (each g gates (unless (file? g) (setup-failed "gate file ~a is missing" g)))
+      (unless (file? (str dir ".manifest")) (setup-failed "~a.manifest missing (stage-web)" arg))
+      ;; at the START: what is about to judge the tree, and the checkout
+      (let* ((gate-lines (map (lambda (g) (str "gate " (file-sha256 g) " " (realpath g))) gates))
+             (tools (tools-identity tasks-dir))
+             (head (out git rev-parse HEAD cwd: ,root))
+             (clean (equal? "" (out git status --porcelain "--untracked-files=no" cwd: ,root)))
+             (want (manifest-body (str dir ".manifest")))
+             (got (guard (e ((refusal? e) (say "tree-manifest refused ~a: ~a" arg (refusal-message e)) #f))
+                    (string-join (tree-manifest dir (str dir ".pages")) "\n"))))
+        (println "check-site: ~a, ~a, HEAD ~a~a" arg tools (substring head 0 12) (if clean "" " (tracked changes)"))
+        (let ((manifest-ok (and got (equal? got want))))
+          (if manifest-ok
+              (println "  ok   manifest: ~a files match (the tree and ~a.pages)" (length (split got "\n")) arg)
+              (println "  FAIL manifest: the tree no longer matches its manifest; restage"))
+          (let* ((node-run ($? node ,(path tasks-dir "checks" "check-site.mjs") ,dir --arm ,arm
+                               cwd: ,root timeout: 1800))
+                 (node-out (stdout-of node-run)))
+            (display node-out)
+            (unless (equal? "" (trim (stderr-of node-run))) (eprintln "~a" (trim (stderr-of node-run))))
+            (cond ((timed-out? node-run)
+                   (println "TIMED-OUT: check-site.mjs ran 1800 s; no verdict")
+                   (exit 2))
+                  ((not (memv (exit-status node-run) '(0 1)))
+                   (println "SETUP-FAILED: check-site.mjs exited ~a; no verdict" (exit-status node-run))
+                   (exit 2))
+                  ((and manifest-ok (ok? node-run))
+                   (let ((text (str "manifest-sha256 " (file-sha256 (str dir ".manifest")) "\n"
+                                    "tools " tools "\n"
+                                    (string-join gate-lines "\n") "\n"
+                                    "gate-head " head "\n"
+                                    "gate-clean " (if clean "yes" "no") "\n"
+                                    "at " (out date -u "+%Y-%m-%dT%H:%M:%SZ") "\n")))
+                     (write-text verified text)
+                     (unless (equal? (read-text verified) text)
+                       (refuse "~a did not read back as written" verified))
+                     (println "GREEN -> ~a.verified~a" arg
+                              (if clean "" " (NOTE: tracked changes in the checkout; publish-web will refuse)"))
+                     (exit 0)))
+                  (else
+                   (println "RED: no ~a.verified" arg)
+                   (exit 1)))))))))

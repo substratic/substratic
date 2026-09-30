@@ -1,0 +1,81 @@
+;;; (substratic tasks deploy) - the files a deploy carries beside the staged
+;;; tree, generated from substratic.sgv: the Pages Function that serves the
+;;; wasm from R2 (tasks/templates/wasm-function.js) and wrangler.json.
+;;;
+;;; stage-web writes them to DIR.pages/, the manifest hashes them as
+;;; @functions/... and @wrangler.json, and publish-web copies DIR.pages/ into
+;;; its deploy directory as it is: wrangler.json already names "tree" as the
+;;; output directory, the name the deploy directory gives the tree.
+;;;
+;;; Every value substituted here was checked against a whitelist when
+;;; substratic.sgv was read (no quote, backslash or newline can reach the
+;;; JSON or the JavaScript), and a placeholder left unfilled is a refusal.
+
+(define-library (substratic tasks deploy)
+  (import (sigil shell prelude) (substratic tasks common) (substratic tasks config))
+  (export write-pages-dir
+          wasm-function-text
+          wrangler-json-text
+          wasm-key
+          templates-dir)
+  (begin
+
+    (define (templates-dir tasks-dir) (path tasks-dir "templates"))
+
+    (define (fill text pairs)
+      (let ((out (let loop ((t text) (ps pairs))
+                   (if (null? ps)
+                       t
+                       (loop (string-replace t (str "{{" (caar ps) "}}") (cdar ps)) (cdr ps))))))
+        (when (contains? out "{{")
+          (refuse "a template placeholder was left unfilled: ~a"
+                  (let ((m (regex-search "\\{\\{[A-Z0-9_]*\\}\\}" out))) (if m (match-group m 0) "{{"))))
+        out))
+
+    ;; ROUTE/<sha16>/<name>.wasm: the wasm's key in R2 and its path on the site
+    (define (wasm-key config sha16)
+      (str (cfg config "publish" "wasm" "route") "/" sha16 "/"
+           (cdr (assoc "name" (publish-app config))) ".wasm"))
+
+    (define (wasm-function-text config tasks-dir)
+      (let ((noindex (let ((w (cfg-opt config "publish" "wasm" "noindex")))
+                       (if w (equal? w "yes") (equal? (cfg config "publish" "indexing") "noindex")))))
+        (fill (read-text (path (templates-dir tasks-dir) "wasm-function.js"))
+              (list (cons "ROUTE" (cfg config "publish" "wasm" "route"))
+                    (cons "NAME" (cdr (assoc "name" (publish-app config))))
+                    (cons "BINDING" (cfg config "publish" "wasm" "binding"))
+                    (cons "BUCKET" (cfg config "publish" "wasm" "bucket"))
+                    (cons "ROBOTS_SET_LINE" (if noindex "  h.set(\"x-robots-tag\", \"noindex\");\n" ""))
+                    (cons "ROBOTS_404" (if noindex ", headers: { \"x-robots-tag\": \"noindex\" }" ""))))))
+
+    ;; JSON.stringify(cfg, null, 2) + "\n", key for key, for the four keys
+    (define (wrangler-json-text config)
+      (str "{\n"
+           "  \"name\": \"" (cfg config "publish" "pages" "project") "\",\n"
+           "  \"pages_build_output_dir\": \"tree\",\n"
+           "  \"compatibility_date\": \"" (cfg config "publish" "pages" "compatibility-date") "\",\n"
+           "  \"r2_buckets\": [\n"
+           "    {\n"
+           "      \"binding\": \"" (cfg config "publish" "wasm" "binding") "\",\n"
+           "      \"bucket_name\": \"" (cfg config "publish" "wasm" "bucket") "\"\n"
+           "    }\n"
+           "  ]\n"
+           "}\n"))
+
+    ;; Write OUT/functions/ROUTE/[[path]].js and OUT/wrangler.json. OUT must
+    ;; not exist.
+    (define (write-pages-dir config tasks-dir out)
+      (when (file-exists? out) (refuse "~a exists; remove it to regenerate" out))
+      (let* ((route (cfg config "publish" "wasm" "route"))
+             (fdir (path out "functions" route))
+             (fn (path fdir "[[path]].js"))
+             (wj (path out "wrangler.json"))
+             (fn-text (wasm-function-text config tasks-dir))
+             (wj-text (wrangler-json-text config)))
+        (ensure-directory fdir)
+        (write-text fn fn-text)
+        (write-text wj wj-text)
+        ;; read back: a write that lost bytes must not pass as generated
+        (unless (and (equal? (read-text fn) fn-text) (equal? (read-text wj) wj-text))
+          (refuse "the generated files in ~a did not read back as written" out))
+        (list fn wj)))))

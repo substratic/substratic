@@ -1,0 +1,8 @@
+;;; Loads the tasks' shared libraries, (substratic tasks ...), for a task
+;;; script run by path (sigil .sigil/deps/substratic/tasks/X.sgl) on a sigil
+;;; without `sigil task`. Under `sigil task` (0.22.11+) tasks/ is already on
+;;; the library path and loading again is harmless (measured on 0.22.8 with
+;;; -L tasks). Order matters: each library only imports ones above it.
+(for-each
+  (lambda (lib) (load (path (script-dir) "substratic" "tasks" (str lib ".sgl"))))
+  '("common" "config" "manifest" "deploy" "credentials" "r2"))

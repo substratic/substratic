@@ -1,0 +1,173 @@
+;;; (substratic tasks common) - what every Substratic task shares: its
+;;; messages, its refusals, the project it runs in, and file hashes.
+;;;
+;;; A task prints to stderr, one line per message, each starting with the
+;;; task's name ("publish-web: ..."). A refusal is raised, not exited, so a
+;;; task can ask a library to check something and decide what a refusal
+;;; means; `with-refusals` at the top of a task turns an unhandled one into
+;;; "NAME: REFUSED: why" and exit 1.
+
+(define-library (substratic tasks common)
+  (import (sigil shell prelude) (sigil crypto) (sigil list))
+  (export set-task-name!
+          task-name
+          say
+          refuse
+          refusal?
+          refusal-message
+          usage-error
+          setup-failed
+          setup-failed!
+          task-exit
+          with-refusals
+          project-dir
+          project-root-procedure
+          file-sha256
+          file-sha16
+          text-sha256
+          expand-home
+          one-line?
+          tools-identity
+          require-tools!)
+  (begin
+
+    (define current-task "substratic")
+
+    (define (set-task-name! name) (set! current-task name))
+
+    (define (task-name) current-task)
+
+    (define (say fmt . args)
+      (eprintln "~a: ~a" current-task (apply format (cons fmt args))))
+
+    ;; A refusal: raised as (substratic-refusal . MESSAGE) so a caller can
+    ;; tell it from a bug (anything else propagates as itself).
+    (define (refuse fmt . args)
+      (raise (cons 'substratic-refusal (apply format (cons fmt args)))))
+
+    (define (refusal? e)
+      (and (pair? e) (eq? (car e) 'substratic-refusal) (string? (cdr e))))
+
+    (define (refusal-message e) (cdr e))
+
+    ;; Bad arguments: exit 2, as the sh scripts did.
+    (define (usage-error fmt . args)
+      (eprintln "~a: ~a" current-task (apply format (cons fmt args)))
+      (exit 2))
+
+    ;; The task could not set itself up (a missing tool, config or input it
+    ;; needs to even start): exit 2 with SETUP-FAILED, never a verdict.
+    (define (setup-failed fmt . args)
+      (eprintln "~a: SETUP-FAILED: ~a" current-task (apply format (cons fmt args)))
+      (exit 2))
+
+    ;; Leave the task with exit status N AFTER unwinding: `exit' called inside
+    ;; with-temp-dir or dynamic-wind skips their cleanup (measured by the
+    ;; adversarial review, 2026-09-29), so code inside those scopes raises
+    ;; this and with-refusals exits once the scopes have closed.
+    (define (task-exit n) (raise (cons 'substratic-exit n)))
+
+    ;; setup-failed for code inside a cleanup scope: prints, then task-exit 2.
+    (define (setup-failed! fmt . args)
+      (eprintln "~a: SETUP-FAILED: ~a" current-task (apply format (cons fmt args)))
+      (task-exit 2))
+
+    ;; Run THUNK; a refusal nobody handled prints "NAME: REFUSED: why" and
+    ;; exits 1; a task-exit exits with its status. Both happen after every
+    ;; scope inside THUNK has unwound. Everything else propagates.
+    (define (with-refusals thunk)
+      (let ((r (guard (e ((refusal? e)
+                          (eprintln "~a: REFUSED: ~a" current-task (refusal-message e))
+                          (cons 'substratic-exit 1))
+                         ((and (pair? e) (eq? (car e) 'substratic-exit) (integer? (cdr e))) e))
+                 (thunk))))
+        (if (and (pair? r) (eq? (car r) 'substratic-exit)) (exit (cdr r)) r)))
+
+    ;; `project-root` is a prelude procedure from sigil 0.22.11 (sigil task).
+    ;; Look it up by name at run time: an unbound-variable error naming
+    ;; exactly `project-root` means "this sigil has none"; any other error is
+    ;; re-raised, so a typo or a broken prelude cannot pass as "absent".
+    (define (project-root-procedure)
+      (guard (e ((and (error-object? e)
+                      (equal? (error-object-irritants e) (list "project-root"))
+                      (contains? (error-object-message e) "unbound variable"))
+                 #f))
+        (eval 'project-root)))
+
+    ;; The project a task works on: `(project-root)` under `sigil task`,
+    ;; else the nearest directory at or above the working directory that
+    ;; holds a package.sgl (what sigil's own project detection does).
+    (define (project-dir)
+      (let* ((proc (project-root-procedure))
+             (root (and proc (proc))))
+        (if (string? root)
+            root
+            (let walk ((d (realpath (current-directory))))
+              (cond ((file? (path d "package.sgl")) d)
+                    ((equal? d "/")
+                     (refuse "no package.sgl here or in any parent directory of ~a; run this from the game's checkout"
+                             (current-directory)))
+                    (else (walk (dirname d))))))))
+
+    (define (file-sha256 p) (sha256 (read-file-bytes p)))
+
+    (define (file-sha16 p) (substring (file-sha256 p) 0 16))
+
+    (define (text-sha256 s) (sha256 s))
+
+    ;; "~/x" -> "$HOME/x"; anything else unchanged.
+    (define (expand-home p)
+      (if (starts-with? p "~/")
+          (path (or (getenv "HOME") (refuse "HOME is not set, so ~a cannot be found" p))
+                (substring p 2 (string-length p)))
+          p))
+
+    (define (one-line? s)
+      (and (string? s) (not (contains? s "\n")) (not (contains? s "\r"))))
+
+    ;; "substratic VERSION SHA": the tools that are running, read from the
+    ;; package they live in (TASKS-DIR is the tasks/ directory). The sha is
+    ;; the checkout's HEAD when it is a git checkout, else the name of the
+    ;; dependency directory sigil installed it as (substratic-<sha>).
+    (define (tools-identity tasks-dir)
+      (let* ((pkg-root (realpath (path tasks-dir "..")))
+             (pkg (let ((f (path pkg-root "package.sgl")))
+                    (unless (file? f) (refuse "the tools are not inside a package: ~a is missing" f))
+                    (read-text f)))
+             (m (regex-search "version: \"([0-9]+\\.[0-9]+\\.[0-9]+)\"" pkg))
+             (version (if m (match-group m 1) "unknown"))
+             (git ($? git -C ,pkg-root rev-parse HEAD))
+             ;; the tools' own files, untracked ones included: a new task
+             ;; file not yet committed makes the identity -dirty
+             (dirty ($? git -C ,pkg-root status --porcelain -- tasks package.sgl))
+             (base (basename pkg-root))
+             (sha (cond ((ok? git)
+                         (str (trim (stdout-of git))
+                              (cond ((not (ok? dirty)) "-unverified")
+                                    ((not (equal? "" (trim (stdout-of dirty)))) "-dirty")
+                                    (else ""))))
+                        ;; an installed dependency: sigil names its tree <...>-substratic-<sha>
+                        ((regex-search "substratic-([0-9a-f]{7,40})$" base)
+                         (match-group (regex-search "substratic-([0-9a-f]{7,40})$" base) 1))
+                        (else "unknown"))))
+        (format "substratic ~a ~a" version sha)))
+
+    ;; A preflight for tools a task needs only on some paths (the rest go in
+    ;; the task's `(requires (tools ...))`): refuses naming EVERY missing
+    ;; one at once. A tool is present when an executable file of that name
+    ;; is in a PATH directory.
+    (define (require-tools! names)
+      (let* ((dirs (split (or (getenv "PATH") "") ":"))
+             (found? (lambda (n)
+                       (let loop ((ds dirs))
+                         (and (pair? ds)
+                              (let* ((p (path (car ds) n)) (st (and (file? p) (file-stat p))))
+                                (or (and st (executable-mode? (stat-mode st)))
+                                    (loop (cdr ds))))))))
+             (missing (filter (lambda (n) (not (found? n))) names)))
+        (unless (null? missing)
+          (refuse "required tools are not on PATH: ~a" (string-join missing ", ")))))
+
+    (define (executable-mode? mode)
+      ;; any of the three x bits (0o111)
+      (or (odd? (quotient mode 1)) (odd? (quotient mode 8)) (odd? (quotient mode 64))))))

@@ -1,0 +1,135 @@
+;;; (substratic tasks r2) - single R2 objects through R2's S3-compatible API,
+;;; with a site's Cloudflare API token. The games' scripts/r2-s3 (Phantom
+;;; 842b520), in Sigil.
+;;;
+;;; This path exists because the site tokens are scoped to ONE bucket
+;;; ("Workers R2 Storage Bucket Item Read/Write" on it, nothing else):
+;;; `wrangler r2 object get/put --remote` goes through Cloudflare's REST
+;;; object endpoint, which answers 403 to a bucket-scoped token (measured
+;;; 2026-09-25).
+;;;
+;;;   (r2-head cred bucket key)                   -> 0 present, 3 absent
+;;;   (r2-get  cred bucket key file)              -> 0 (FILE written), 3 absent
+;;;   (r2-put  cred bucket key file type [cc])    -> 0
+;;;
+;;; 3 means exactly "404 NoSuchKey". Anything else (a missing bucket, 404
+;;; NoSuchBucket; a refusal; a network failure) raises a refusal carrying the
+;;; HTTP status and R2's error code, so a refused or broken request, or a
+;;; typo in the bucket name, is never mistaken for "absent". put signs the
+;;; file's sha256 (x-amz-content-sha256), so R2 refuses a body that arrived
+;;; different from the file hashed here. Nothing here deletes, and put does
+;;; not check whether the key exists: callers do get -> put -> get -> compare.
+;;;
+;;; The S3 access key id is the token's id, asked of Cloudflare's
+;;; /tokens/verify; the S3 secret is sha256(token). Neither goes on a command
+;;; line: curl reads them from config files in a mode-700 directory that is
+;;; removed when the call returns (or raises). R2_S3_ENDPOINT and R2_API_BASE
+;;; override the endpoints (the tests point them at a local mock).
+
+(define-library (substratic tasks r2)
+  (import (sigil shell prelude) (sigil json) (substratic tasks common) (substratic tasks credentials))
+  (export r2-head r2-get r2-put r2-check-names)
+  (begin
+
+    (define (bad-arg fmt . args) (raise (cons 'r2-usage (apply format (cons fmt args)))))
+
+    ;; every value that reaches a URL, a header or a config file is one line
+    ;; matching a whitelist; keys may not leave their bucket (curl drops . and
+    ;; .. segments before signing, so "../other/x" would be sent as /other/x)
+    (define (r2-check-names bucket key)
+      (unless (and (one-line? bucket) (regex-match? "[a-z0-9][a-z0-9-]{1,62}" bucket))
+        (bad-arg "bad bucket name: ~a" bucket))
+      (unless (and (one-line? key) (regex-match? "[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*" key))
+        (bad-arg "refusing key ~a: only [A-Za-z0-9._-] segments joined by /" key))
+      (when (regex-search "(^|/)\\.\\.?(/|$)" key)
+        (bad-arg "refusing key ~a: a . or .. segment" key)))
+
+    (define (no-control? s)
+      (not (regex-search "[\\x00-\\x1f\\x7f]" s)))
+
+    (define (api-base) (or (getenv "R2_API_BASE") "https://api.cloudflare.com/client/v4"))
+    (define (endpoint cred)
+      (or (getenv "R2_S3_ENDPOINT") (str "https://" (credential-account cred) ".r2.cloudflarestorage.com")))
+
+    ;; the token's id: account-owned tokens first, then user tokens
+    ;; curl reads its secrets as a config on STDIN (-K -): never on a command
+    ;; line, never in a file a signal could leave behind (the adversarial
+    ;; review, 2026-09-29: a TERM mid-upload left s3.cfg in /tmp)
+    (define (token-id cred)
+      (let ((cfg (str "header = \"Authorization: Bearer " (credential-token cred) "\"\n")))
+        (let loop ((ps (list (str "accounts/" (credential-account cred) "/tokens/verify") "user/tokens/verify")))
+          (if (null? ps)
+              #f
+              (let* ((r ($? curl -sS --connect-timeout 20 --max-time 60 -K - ,(str (api-base) "/" (car ps)) in: ,cfg))
+                     (doc (and (ok? r) (guard (e (#t #f)) (json-decode (stdout-of r)))))
+                     (res (and (dict? doc) (dict-ref doc success: #f) (dict-ref doc result: #f)))
+                     (id (and (dict? res) (equal? (dict-ref res status: #f) "active") (dict-ref res id: #f))))
+                (if (and (string? id) (not (equal? id "")))
+                    id
+                    (loop (cdr ps))))))))
+
+    ;; one signed request: (code . r2-error-code); the body lands in WORK/body
+    (define (s3 cred work s3cfg bucket key extra)
+      (let ((body (path work "body")))
+        (when (file-exists? body) (delete-file body))
+        (let* ((r ($? curl -sS -K - --aws-sigv4 "aws:amz:auto:s3" --connect-timeout 20
+                      --speed-limit 1024 --speed-time 60 --retry 3 -o ,body -w "%{http_code}"
+                      ,@extra ,(str (endpoint cred) "/" bucket "/" key) in: ,s3cfg))
+               (code (if (ok? r) (trim (stdout-of r)) (str "curl-exit-" (exit-status r))))
+               ;; R2's error document names the error; a 200's body is the
+               ;; object (a 28 MB wasm took minutes to scan as text), so only
+               ;; a small non-200 body is read
+               (err (if (and (not (equal? code "200")) (file? body) (< (file-size body) 65536))
+                        (let ((m (regex-search "<Code>([^<]*)</Code>" (read-text body))))
+                          (if m (match-group m 1) ""))
+                        "")))
+          (cons code err))))
+
+    (define (call-with-s3 cred bucket key proc)
+      (r2-check-names bucket key)
+      (let ((kid (token-id cred)))
+        (unless kid (refuse "Cloudflare did not verify the token as an active token"))
+        ;; the work dir holds only the response body: no secret on disk
+        (with-temp-dir work
+          ($ chmod 700 ,work)
+          (proc work (str "user = \"" kid ":" (text-sha256 (credential-token cred)) "\"\n")))))
+
+    (define (fail op bucket key res)
+      (refuse "~a ~a/~a: HTTP ~a~a" op bucket key (car res)
+              (if (equal? (cdr res) "") "" (str " (" (cdr res) ")"))))
+
+    (define (r2-head cred bucket key)
+      (call-with-s3 cred bucket key
+        (lambda (work s3cfg)
+          (let ((res (s3 cred work s3cfg bucket key '("-I"))))
+            (cond ((equal? (car res) "200") 0)
+                  ((equal? (car res) "404")
+                   ;; a HEAD has no body to say WHICH 404: ask again with a
+                   ;; GET, whose body names NoSuchKey or NoSuchBucket
+                   (let ((g (s3 cred work s3cfg bucket key '())))
+                     (cond ((equal? (car g) "200") 0)
+                           ((and (equal? (car g) "404") (equal? (cdr g) "NoSuchKey")) 3)
+                           (else (fail "head" bucket key g)))))
+                  (else (fail "head" bucket key res)))))))
+
+    (define (r2-get cred bucket key file)
+      (call-with-s3 cred bucket key
+        (lambda (work s3cfg)
+          (let ((res (s3 cred work s3cfg bucket key '())))
+            (cond ((equal? (car res) "200") ($ cp ,(path work "body") ,file) 0)
+                  ((and (equal? (car res) "404") (equal? (cdr res) "NoSuchKey")) 3)
+                  (else (fail "get" bucket key res)))))))
+
+    (define (r2-put cred bucket key file type . cc)
+      (let ((cache (if (pair? cc) (car cc) "")))
+        (unless (and (one-line? type) (no-control? type) (no-control? cache))
+          (bad-arg "refusing a control character in TYPE or CACHE-CONTROL"))
+        (unless (file? file) (refuse "~a is not a file" file))
+        (call-with-s3 cred bucket key
+          (lambda (work s3cfg)
+            (let ((res (s3 cred work s3cfg bucket key
+                           (append (list "-T" file "-H" (str "Content-Type: " type)
+                                         "-H" (str "x-amz-content-sha256: " (file-sha256 file)))
+                                   (if (equal? cache "") '() (list "-H" (str "Cache-Control: " cache)))))))
+              (unless (equal? (car res) "200") (fail "put" bucket key res))
+              0)))))))

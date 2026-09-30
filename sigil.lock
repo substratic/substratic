@@ -2,16 +2,16 @@
 (lock
   (package name: "sigil-lib"
            url: "codeberg:sigil/sigil"
-           ref: ">=0.22.7, <1.0"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           ref: ">=0.22.11, <1.0"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-lib"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-stdlib"
            url: "codeberg:sigil/sigil"
-           ref: ">=0.22.7, <1.0"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           ref: ">=0.22.11, <1.0"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-stdlib"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-desktop"
            url: "codeberg:sigil/sigil-desktop"
            ref: "^0.13.0"
@@ -24,22 +24,22 @@
            version: "0.13.0")
   (package name: "sigil-browser"
            url: "codeberg:sigil/sigil"
-           ref: ">=0.22.7"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           ref: ">=0.22.11"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-browser"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-test"
            url: "codeberg:sigil/sigil"
-           ref: ">=0.22.7"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           ref: ">=0.22.11"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-test"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-test-runner"
            url: "codeberg:sigil/sigil"
-           ref: ">=0.22.7"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           ref: ">=0.22.11"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-test-runner"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-json"
            url: "codeberg:sigil/sigil-json"
            ref: "^0.16.0"
@@ -48,9 +48,9 @@
   (package name: "sigil-wasm-gles3"
            url: "codeberg:sigil/sigil"
            ref: ">=0.21"
-           sha: "26cf03de31baf46418ea636a46b264f9d50dcdbe"
+           sha: "318332fd7f005d4a6cdc834cb8a1e632c0ba923f"
            package-selector: "sigil-wasm-gles3"
-           version: "0.22.8")
+           version: "0.22.11")
   (package name: "sigil-crypto"
            url: "codeberg:sigil/sigil-crypto"
            ref: "^0.16.0"

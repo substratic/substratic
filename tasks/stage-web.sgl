@@ -1,0 +1,191 @@
+;;; stage-web DIR - stage a game's site for check-site and publish-web.
+;;;
+;;;   sgx substratic:stage-web build/site
+;;;   PHANTOM_WEB_DIR=build/remote-web-<sha> sgx substratic:stage-web build/site
+;;;
+;;; From substratic.sgv's (publish ...) section, it writes:
+;;;
+;;;   DIR/<site files>          site: files:, copied from site: source:
+;;;   DIR/<mount>/              the app's web build: its page, the
+;;;                             sigil-wasm-bridges.* files, assets/
+;;;   DIR/<route>/<sha16>/<app>.wasm
+;;;                             the wasm, named by the first 16 hex of its
+;;;                             sha256; the page's data-wasm="<app>" is
+;;;                             rewritten to point there. publish-web moves it
+;;;                             to R2; here it is a plain file so check-site
+;;;                             can serve it.
+;;;   DIR.pages/                the generated Function and wrangler.json
+;;;                             ((substratic tasks deploy))
+;;;   DIR.manifest              header lines (# head, # built, # wasm, # game,
+;;;                             # app, # route, # indexing) and the tree
+;;;                             manifest of DIR with DIR.pages
+;;;
+;;; The web build is the app's web: dir:, or its web: env: variable when set
+;;; (a runner build, build/remote-web-<sha>, carries BUILD-SHA). The mount is
+;;; fixed, or read as the config says (an environment variable, a file, a
+;;; default) and checked against its pattern.
+;;;
+;;; REFUSES, writing nothing, when DIR is not under the checkout's build/,
+;;; when DIR or DIR.pages exists (remove them to restage), when the web
+;;; build lacks its page, wasm, assets/ or a file the app requires:, when a
+;;; site file is missing, or when the page does not say data-wasm="<app>"
+;;; exactly once. A restage removes a stale DIR.verified.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (sigil list) (substratic tasks common) (substratic tasks config) (substratic tasks manifest)
+        (substratic tasks deploy))
+(requires (tools git cp du find))
+(set-task-name! "stage-web")
+
+(define tasks-dir (realpath (script-dir)))
+(define args (script-args))
+(unless (= (length args) 1) (usage-error "usage: stage-web DIR"))
+
+(define (count-occurrences text needle)
+  (let loop ((start 0) (n 0))
+    (let ((m (regex-search (regex-quote needle) text start: start)))
+      (if m (loop (match-end m) (+ n 1)) n))))
+
+(define (regex-quote s) (regex-replace-all "[\\\\.+*?()|\\[\\]{}^$]" s "\\\\$0"))
+
+(with-refusals
+  (lambda ()
+    (let* ((root (project-dir))
+           (config (read-config root))
+           (app (publish-app config))
+           (name (cdr (assoc "name" app)))
+           (route (cfg config "publish" "wasm" "route"))
+           (mount (resolve-mount app route))
+           (web (resolve-web-dir app root))
+           (arg (let ((d (car args)))
+                  (if (and (> (string-length d) 1) (ends-with? d "/")) (substring d 0 (- (string-length d) 1)) d)))
+           (dir (if (starts-with? arg "/") arg (path (current-directory) arg)))
+           (dir-parent (realpath (dirname dir)))
+           (build (path root "build"))
+           (pages (str dir ".pages"))
+           (site-src (path root (cfg config "publish" "site" "source")))
+           (site-rel (cfg config "publish" "site" "source"))
+           (copy-mode (cfg config "publish" "site" "copy"))
+           ;; the site's files, relative to its source: the listed ones, or
+           ;; every git-tracked one (an untracked file there, an editor backup
+           ;; or a stray shot, would otherwise be staged, verified and published)
+           (site-files (if (equal? copy-mode "tracked")
+                           (map (lambda (f) (substring f (+ 1 (string-length site-rel)) (string-length f)))
+                                ;; -z: names as they are (without it git quotes a
+                                ;; name with non-ASCII, a tab or a quote)
+                                (filter (lambda (f) (not (equal? f "")))
+                                        (split (out git ls-files -z -- ,site-rel cwd: ,root) (str (integer->char 0)))))
+                           (cfg config "publish" "site" "files")))
+           (required (if (equal? copy-mode "tracked") (cfg config "publish" "site" "required") site-files))
+           (hook (cfg-opt config "publish" "stage-hook"))
+           (wasm-name (str name ".wasm")))
+      ;; where DIR may be
+      (unless (and dir-parent
+                   (or (equal? dir-parent (realpath build))
+                       (starts-with? dir-parent (str (realpath build) "/"))))
+        (refuse "~a is not under ~a/: stage into the checkout's build/ (it is gitignored)" arg build))
+      (when (file-exists? dir) (refuse "~a exists; remove it to restage" arg))
+      (when (file-exists? pages) (refuse "~a exists; remove it to restage" pages))
+      ;; the build
+      (each f (list "index.html" wasm-name "assets")
+        (unless (file-exists? (path web f))
+          (refuse "~a/~a missing (build the web config, or point ~a at a runner build)"
+                  web f (or (cdr (assoc "web-env" app)) "web: dir:"))))
+      (each f (cdr (assoc "requires" app))
+        (unless (file? (path web f)) (refuse "~a has no ~a (the app requires: it)" web f)))
+      (each f required
+        (unless (file? (path site-src f)) (refuse "~a/~a missing" site-rel f)))
+      ;; paths the stage writes itself: a copy of one in the source would be
+      ;; overwritten or, worse, shipped stale
+      (each f (append (cfg config "publish" "site" "refuse") (list (car (split route "/")) mount))
+        (when (file-exists? (path site-src f))
+          (refuse "~a/~a exists: /~a is generated or staged, never copied from ~a/" site-rel f f site-rel)))
+      (when (null? site-files) (refuse "~a/ has no files to stage" site-rel))
+      (each f site-files
+        (when (symlink? (path site-src f)) (refuse "~a/~a is a symlink" site-rel f)))
+      ;; the hook's inputs: there, and nothing untracked in them (an
+      ;; untracked draft post would be built into the site and published)
+      (when hook
+        (each d (cdr (assoc "inputs" hook))
+          (unless (and (directory? (path root d)) (pair? (directory-list (path root d))))
+            (refuse "~a/ is missing or empty (the stage hook reads it)" d))
+          (let ((untracked (lines git ls-files --others --exclude-standard -- ,d cwd: ,root)))
+            (unless (null? untracked)
+              (refuse "untracked files in ~a/ (commit or move them): ~a" d (string-join untracked " "))))))
+      (let ((want (str "data-wasm=\"" name "\""))
+            (page (read-text (path web "index.html"))))
+        (unless (= (count-occurrences page want) 1)
+          (refuse "~a/index.html does not say ~a exactly once; the page changed shape" web want)))
+
+      ;; a stale verdict must not outlive the tree it was for
+      (when (file-exists? (str dir ".verified"))
+        (delete-file (str dir ".verified"))
+        (say "removed the stale ~a.verified" arg))
+
+      (ensure-directory dir)
+      (each f site-files
+        (ensure-directory (dirname (path dir f)))
+        ($ cp ,(path site-src f) ,(path dir f)))
+      (let ((copied (length (lines find ,dir -type f))))
+        (unless (= copied (length site-files))
+          (refuse "copied ~a of ~a/'s ~a files" copied site-rel (length site-files))))
+      (ensure-directory (path dir mount))
+      ($ cp ,(path web "index.html") ,(path dir mount "index.html"))
+      (let* ((sha16 (file-sha16 (path web wasm-name)))
+             (key (wasm-key config sha16))
+             (page-file (path dir mount "index.html"))
+             (rewritten (str "data-wasm=\"/" route "/" sha16 "/" name "\"")))
+        (ensure-directory (path dir route sha16))
+        ($ cp ,(path web wasm-name) ,(path dir key))
+        (unless (equal? (file-sha16 (path dir key)) sha16)
+          (refuse "the copy of the wasm at ~a does not hash to ~a" key sha16))
+        (write-text page-file
+                    (string-replace (read-text page-file) (str "data-wasm=\"" name "\"") rewritten))
+        (unless (= (count-occurrences (read-text page-file) rewritten) 1)
+          (refuse "the page's data-wasm was not rewritten"))
+        (each f (list-sort string<? (directory-list web))
+          (when (and (starts-with? f "sigil-wasm-bridges.") (file? (path web f)))
+            ($ cp ,(path web f) ,(path dir mount f))))
+        ($ cp -r ,(path web "assets") ,(path dir mount "assets"))
+        ;; the stage hook, into the tree the gate will check
+        (when hook
+          (let* ((pkg (read-text (path root "package.sgl")))
+                 (vm (regex-search "version: \"([0-9]+\\.[0-9]+\\.[0-9]+)\"" pkg))
+                 (version (if vm (match-group vm 1) (refuse "cannot read the package version from package.sgl")))
+                 (build-sha (path web "BUILD-SHA"))
+                 (stamp (if (file? build-sha)
+                            (substring (read-text build-sha trim: #t) 0 12)
+                            (str "local-" (substring (out git rev-parse HEAD cwd: ,root) 0 12))))
+                 (argv (map (lambda (a) (string-replace (string-replace (string-replace a "{dir}" dir) "{version}" version)
+                                                        "{stamp}" stamp))
+                            (cdr (assoc "argv" hook))))
+                 (r ($? ,@argv cwd: ,root err: 'merge timeout: 600)))
+            (eprintln "~a" (trim (stdout-of r)))
+            (unless (ok? r) (refuse "the stage hook ~a failed (~a)" (car argv) (format-outcome r)))
+            (each o (cdr (assoc "outputs" hook))
+              (unless (file? (path dir o)) (refuse "the stage hook wrote no ~a" o)))))
+        (write-pages-dir config tasks-dir pages)
+
+        (let* ((head (out git rev-parse HEAD cwd: ,root))
+               (build-sha-file (path web "BUILD-SHA"))
+               (built (if (file? build-sha-file)
+                          (str (read-text build-sha-file trim: #t) " (runner build)")
+                          (str "local " (if (starts-with? web (str root "/"))
+                                            (substring web (+ 1 (string-length root)) (string-length web))
+                                            web))))
+               (lines (tree-manifest dir pages))
+               (text (str "# head " head "\n"
+                          "# built " built "\n"
+                          "# wasm " sha16 "\n"
+                          "# game " mount "\n"
+                          "# app " name "\n"
+                          "# route " route "\n"
+                          "# indexing " (cfg config "publish" "indexing") "\n"
+                          ;; whether what was copied is HEAD's: publish-web
+                          ;; refuses a tree staged from tracked changes
+                          "# clean " (if (equal? "" (out git status --porcelain "--untracked-files=no" cwd: ,root)) "yes" "no") "\n"
+                          (string-join lines "\n") "\n")))
+          (write-text (str dir ".manifest") text)
+          (unless (equal? (read-text (str dir ".manifest")) text)
+            (refuse "~a.manifest did not read back as written" arg))
+          (say "staged ~a entries (~a) to ~a; the game at /~a/, its wasm at /~a; manifest ~a.manifest"
+               (length lines) (car (split (out du -sh ,dir) "\t")) arg mount key arg))))))

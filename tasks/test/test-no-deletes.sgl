@@ -1,0 +1,98 @@
+;;; test-no-deletes - the tripwire for "the site tools never delete anything
+;;; remote". It scans every file the tasks run (tasks/ but tasks/test/, the
+;;; apparatus) for each known route to a delete, then plants each route in a
+;;; scratch copy and checks the scan goes red on it.
+;;;
+;;; It catches a careless addition, not a determined one: the authority
+;;; boundary is the token (bucket-scoped Item Read/Write, no delete scope on
+;;; Pages or DNS). TASKS=<dir> scans another copy. Last line is VERDICT.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+
+;; (name pattern) - POSIX ERE for grep -E (fast; Sigil's regex over every
+;; line of every file took five minutes for the plant runs)
+(define routes
+  (list (list "wrangler r2 object delete" "r2[\"' ]+object[\"' ]+delete")
+        (list "wrangler r2 bucket delete" "r2[\"' ]+bucket[\"' ]+delete")
+        (list "wrangler r2 bucket lifecycle" "bucket[\"' ]+lifecycle")
+        (list "wrangler pages deployment delete" "deployment[\"' ]+delete")
+        (list "wrangler pages project delete" "project[\"' ]+delete")
+        ;; a quoted verb, or after -X/--request (HTTP verbs; not the word in prose)
+        (list "an HTTP DELETE" "[\"'][Dd][Ee][Ll][Ee][Tt][Ee][\"']|-X ?DELETE|--request[= ]+\"?DELETE")
+        (list "a variable HTTP method" "-X[\"' ]+[,$(]|--request[\"' =]+[,$(]|method:[[:space:]]*[a-zA-Z_$]")
+        (list "S3 multi-object ?delete" "\\?delete")
+        (list "aws s3 rm" "s3[\"' ]+rm([^a-z]|$)")
+        (list "a sync that deletes" "sync[\"' ]+--delete|--delete-(after|before|during|excluded)")
+        (list "rclone delete, purge or sync" "rclone[\"' ]+(delete|deletefile|purge|sync|rmdir)")
+        (list "a .delete( call" "\\.delete\\(")))
+
+(define (scanned-files dir)
+  (filter (lambda (f) (not (contains? f "/test/")))
+          (lines find ,dir -type f "(" -name "*.sgl" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.js" -o -name "*.sh" ")")))
+
+;; (route-name file line-number line) for every hit under DIR. grep exits 1
+;; for "no match" and 2 for an error; an error is a setup failure, never green.
+(define (scan dir)
+  (let ((files (scanned-files dir)) (hits '()))
+    (each r routes
+      (let ((g ($? grep -nHE -e ,(cadr r) ,@files)))
+        (unless (memv (exit-status g) '(0 1))
+          (println "SETUP-FAILED: grep for ~a: ~a" (car r) (trim (stderr-of g))) (exit 2))
+        (each l (filter (lambda (x) (not (equal? x ""))) (split (stdout-of g) "\n"))
+          (let ((m (regex-match "([^:]+):([0-9]+):(.*)" l)))
+            (when m (set! hits (cons (list (car r) (match-group m 1) (string->number (match-group m 2)) (match-group m 3)) hits)))))))
+    (reverse hits)))
+
+(define n 0)
+(define failed 0)
+(define (check name ok)
+  (set! n (+ n 1))
+  (if ok (println "PASS ~a" name) (begin (set! failed (+ failed 1)) (println "FAIL ~a" name))))
+
+;; the population: what was scanned, with a floor (a scan of nothing is green)
+(define files (scanned-files tasks-dir))
+(check (str "scanned " (length files) " files (tasks, libraries, checkers, templates, the runner script)")
+       (and (>= (length files) 20)
+            (member (path tasks-dir "publish-web.sgl") files)
+            (member (path tasks-dir "substratic" "tasks" "r2.sgl") files)
+            (member (path tasks-dir "templates" "wasm-function.js") files)
+            (member (path tasks-dir "runner" "build-web.sh") files)))
+(let ((hits (scan tasks-dir)))
+  (each h hits (println "  hit: ~a at ~a:~a: ~a" (car h) (cadr h) (caddr h) (cadddr h)))
+  (check "no delete route in the tools" (null? hits)))
+
+;; each route planted, in a scratch copy, must be seen
+(with-temp-dir w
+  (define plants
+    (list (list "wrangler r2 object delete" "r2-plant.sgl" "($ wrangler r2 object delete ,key --remote)")
+          (list "wrangler r2 bucket delete" "r2-plant.sgl" "($ wrangler r2 bucket delete ,bucket)")
+          (list "wrangler r2 bucket lifecycle" "r2-plant.sgl" "($ wrangler r2 bucket lifecycle add ,bucket)")
+          (list "wrangler pages deployment delete" "p.sgl" "($ wrangler pages deployment delete ,id)")
+          (list "wrangler pages project delete" "p.sgl" "($ wrangler pages project delete ,project)")
+          (list "an HTTP DELETE" "c.sgl" "($ curl -X DELETE ,url)")
+          (list "an HTTP DELETE" "c.sh" "curl --request DELETE \"$URL\"")
+          (list "an HTTP DELETE" "f.mjs" "await fetch(u, { method: \"DELETE\" });")
+          (list "a variable HTTP method" "c.sgl" "($ curl -X ,verb ,url)")
+          (list "a variable HTTP method" "c.sh" "curl -X \"$1\" \"$URL\"")
+          (list "a variable HTTP method" "f.mjs" "await fetch(u, { method: verb });")
+          (list "S3 multi-object ?delete" "s.sgl" "(s3 cred work bucket \"?delete\" '(\"-T\" \"x\"))")
+          (list "aws s3 rm" "a.sh" "aws s3 rm s3://b/k")
+          (list "a sync that deletes" "a.sh" "aws s3 sync --delete tree s3://b")
+          (list "rclone delete, purge or sync" "a.sh" "rclone purge r2:b")
+          (list "a .delete( call" "templates/f.js" "  await env.WASM.delete(key);")))
+  (each p plants
+    (let ((d (path w (str "copy-" (string-length (caddr p)) "-" (cadr p)))))
+      (ensure-directory d)
+      ($ cp -r ,(str tasks-dir "/.") ,d)
+      (let ((f (path d (cadr p))))
+        (ensure-directory (dirname f))
+        (write-text f (str (if (file? f) (read-text f) "") "\n" (caddr p) "\n"))
+        ;; the plant landed: the file holds it
+        (unless (contains? (read-text f) (caddr p)) (println "SETUP-FAILED: the plant did not land in ~a" f) (exit 2))
+        (let ((hits (scan d)))
+          (check (str "planted " (car p) " (" (cadr p) ": " (caddr p) ") is seen")
+                 (let loop ((hs hits))
+                   (and (pair? hs) (or (and (equal? (caar hs) (car p)) (equal? (cadr (car hs)) f)) (loop (cdr hs))))))))
+      ($ rm -rf ,d))))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

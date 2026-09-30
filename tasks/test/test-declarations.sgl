@@ -1,0 +1,41 @@
+;;; test-declarations - package.sgl's script-tasks: entries, checked the way
+;;; `sigil task` (0.22.11) validates them, so a bad entry is found here and
+;;; not in every game: only file:, description:, usage:, load-path:; a name
+;;; [a-z0-9-]+ that is not build, test or clean; a one-line description; a
+;;; file: inside the package that exists and is a task script. And every
+;;; tasks/*.sgl is declared (a task nobody can run by name is a mistake).
+;;; Last line is VERDICT.
+(import (sigil package) (sigil list))
+(define pkg-root (realpath (path (script-dir) ".." "..")))
+(define n 0)
+(define failed 0)
+(define (check name ok)
+  (set! n (+ n 1))
+  (if ok (println "PASS ~a" name) (begin (set! failed (+ failed 1)) (println "FAIL ~a" name))))
+
+(define entries (package-provides-ref (load-package (path pkg-root "package.sgl")) 'script-tasks:))
+(check (str "package.sgl declares " (if (list? entries) (length entries) 0) " script tasks") (and (list? entries) (>= (length entries) 10)))
+(define (kw-pairs xs) (if (or (null? xs) (null? (cdr xs))) '() (cons (cons (car xs) (cadr xs)) (kw-pairs (cddr xs)))))
+(each e entries
+  (let* ((name (car e))
+         (pairs (kw-pairs (cdr e)))
+         (keys (map (lambda (p) (keyword->string (car p))) pairs))
+         (get (lambda (k) (let ((p (assoc k (map (lambda (p) (cons (keyword->string (car p)) (cdr p))) pairs)))) (and p (cdr p)))))
+         (file (get "file")))
+    (check (str name ": a name [a-z0-9-]+, not reserved")
+           (and (symbol? name) (regex-match? "[a-z0-9-]+" (symbol->string name))
+                (not (memq name '(build test clean)))))
+    (check (str name ": only file:, description:, usage:, load-path:")
+           (and (= (length (cdr e)) (* 2 (length pairs)))
+                (null? (filter (lambda (k) (not (member k '("file" "description" "usage" "load-path")))) keys))))
+    (check (str name ": a one-line description") (and (string? (get "description")) (not (contains? (get "description") "\n"))))
+    (check (str name ": file: " file " exists inside the package")
+           (and (string? file) (not (starts-with? file "/")) (not (contains? file ".."))
+                (file? (path pkg-root file))
+                (starts-with? (realpath (path pkg-root file)) (str pkg-root "/"))))))
+(let ((declared (map (lambda (e) (let ((p (member 'file: e))) (and p (cadr p)))) entries)))
+  (each f (list-sort string<? (directory-list (path pkg-root "tasks")))
+    (when (ends-with? f ".sgl")
+      (check (str "tasks/" f " is declared") (member (str "tasks/" f) declared)))))
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

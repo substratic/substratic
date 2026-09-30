@@ -1,0 +1,86 @@
+;;; host-site DIR | --stop - serve a staged tree on a private interface (a preview)
+;;; through checks/serve-site.mjs, Pages' rules: https and http on the ports
+;;; substratic.sgv's host: section names (its interface:, e.g. a VPN's),
+;;; through checks/serve-site.mjs --iface.
+;;;
+;;;   sgx substratic:host-site build/site
+;;;   sgx substratic:host-site --stop
+;;;
+;;; The servers run detached from this task, their logs and PIDs in the
+;;; host: dir: (HOSTDIR/site-PORT.log, site-PORT.pid). The certificate is
+;;; HOSTDIR/tls/{cert,key}.pem, made once by the game's own scripts/host.
+;;; --stop, and a start (which stops first), stop only a server this task
+;;; started: the PID in its file must be a node process whose cwd is HOSTDIR
+;;; and whose command line runs serve-site.mjs; anything else is left alone
+;;; and named. DIR must still match its manifest.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks config) (substratic tasks manifest))
+(requires (tools node kill))
+(set-task-name! "host-site")
+
+(define tasks-dir (realpath (script-dir)))
+(define args (script-args))
+(unless (= (length args) 1) (usage-error "usage: host-site DIR | host-site --stop"))
+
+;; the PID in FILE if it is our serve-site (node, cwd HOSTDIR, serve-site.mjs), else #f
+(define (our-server file hostdir)
+  (and (file? file)
+       (let* ((pid (read-text file trim: #t))
+              (proc (str "/proc/" pid)))
+         (and (regex-match? "[0-9]+" pid)
+              (let ((exe (read-symlink (path proc "exe")))
+                    (cwd (read-symlink (path proc "cwd")))
+                    (cmd (guard (e (#t "")) (read-text (path proc "cmdline")))))
+                (cond ((not exe) #f)
+                      ((and (equal? (basename (regex-replace " \\(deleted\\)$" exe "")) "node")
+                            (equal? cwd hostdir)
+                            (contains? cmd "serve-site.mjs"))
+                       pid)
+                      (else (say "leaving pid ~a alone: not this task's server (~a)" pid exe) #f)))))))
+
+(define (stop hostdir ports)
+  (each p ports
+    (let* ((file (path hostdir (str "site-" p ".pid")))
+           (pid (our-server file hostdir)))
+      (when pid
+        ($ kill ,pid)
+        (say "stopped pid ~a (port ~a)" pid p))
+      (when (file-exists? file) (delete-file file)))))
+
+(define (main)
+  (let* ((root (project-dir))
+         (config (read-config root))
+         (hostdir (realpath (expand-home (cfg config "publish" "host" "dir"))))
+         (https-port (cfg config "publish" "host" "https"))
+         (http-port (cfg config "publish" "host" "http"))
+         (ports (list https-port http-port))
+         (iface (or (cfg-opt config "publish" "host" "interface")
+                    (refuse "substratic.sgv: host: has no interface: (the network interface to serve the preview on)"))))
+    (unless hostdir (refuse "the host: dir: ~a does not exist (the game's scripts/host makes it)"
+                            (cfg config "publish" "host" "dir")))
+    (stop hostdir ports)
+    (unless (equal? (car args) "--stop")
+      (let* ((arg (car args))
+             (dir (realpath (if (starts-with? arg "/") arg (path (current-directory) arg)))))
+        (unless (and dir (file? (path dir "index.html")) (file? (str dir ".manifest")))
+          (usage-error "give a staged tree (stage-web DIR): ~a" arg))
+        (unless (equal? (string-join (tree-manifest dir (str dir ".pages")) "\n") (manifest-body (str dir ".manifest")))
+          (refuse "~a no longer matches its manifest; restage" arg))
+        (unless (file? (path hostdir "tls" "cert.pem"))
+          (refuse "no ~a/tls/cert.pem (run the game's scripts/host once)" hostdir))
+        (let ((serve (path tasks-dir "checks" "serve-site.mjs")))
+          (each spec (list (list https-port "--tls" "--tls-dir" "tls") (list http-port))
+            (let* ((p (car spec))
+                   (log (path hostdir (str "site-" p ".log")))
+                   (proc (spawn node ,serve ,dir ,(number->string p) --iface ,iface ,@(cdr spec)
+                                cwd: ,hostdir detached: #t out: ,log err: 'merge)))
+              (write-text (path hostdir (str "site-" p ".pid")) (str (process-pid proc) "\n"))
+              (wait-until (or (contains? (read-text log missing: "") "serve-site:")
+                              (not (process-alive? proc)))
+                          timeout: 10 interval: 0.2 message: (str "the server on port " p " said nothing in 10 s"))
+              (display (read-text log missing: ""))
+              (unless (process-alive? proc)
+                (refuse "the server on port ~a exited (is the port taken? the game's scripts/host --stop)" p)))))))
+    0))
+
+(exit (with-refusals main))

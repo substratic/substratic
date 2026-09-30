@@ -1,0 +1,72 @@
+;;; check-linux-binary FILE - does this Linux executable start on an
+;;; ordinary distribution (Ubuntu, Fedora, Arch, SteamOS), or only on the
+;;; machine that built it? Ported from the games' sh
+;;; scripts/check-linux-binary (identical in both, 2026-09-29).
+;;;
+;;;   sgx substratic:check-linux-binary build/dist/game/bin/game
+;;;   GLIBC_MAX=2.36 sgx substratic:check-linux-binary FILE
+;;;
+;;; A native build on Guix asks for its ELF interpreter at a /gnu/store path
+;;; (…-glibc-2.41/lib/ld-linux-x86-64.so.2) that exists on no other system,
+;;; where the kernel refuses to start it with "No such file or directory".
+;;; make-portable points the interpreter at /lib64/ld-linux-x86-64.so.2 and
+;;; runs this on the result. Checked, each printed: an x86-64 ELF64; the
+;;; interpreter is /lib64/ld-linux-x86-64.so.2; no /gnu/store path in the
+;;; dynamic section (RUNPATH, RPATH, NEEDED); every NEEDED library is one
+;;; glibc provides; the newest GLIBC_ symbol version it needs ("glibc-floor
+;;; X.Y", counting GLIBC_ABI_DT_RELR as 2.36) is not newer than GLIBC_MAX
+;;; (default 2.35: Ubuntu 22.04). readelf comes from PATH, else from
+;;; `guix shell binutils`.
+;;; Exit 0 portable ("PASS portable"), 1 not (a FAIL line per reason), 125
+;;; could not check.
+(define args (script-args))
+(define (setup why) (eprintln "check-linux-binary: SETUP-FAILED, ~a" why) (exit 125))
+(unless (and (= (length args) 1) (file? (car args))) (eprintln "check-linux-binary: give an existing file") (exit 125))
+(define f (car args))
+(define readelf-argv
+  (if (ok? ($? sh -c "command -v readelf")) '("readelf") '("guix" "shell" "binutils" "--" "readelf")))
+(define (readelf flag)
+  (let ((r ($? ,@readelf-argv ,flag ,f timeout: 300)))
+    (and (ok? r) (stdout-of r))))
+(define elfh (or (readelf "-hW") (setup (str "readelf could not read " f))))
+(define hdr (or (readelf "-lW") (setup (str "readelf could not read " f))))
+(define dyn (or (readelf "-dW") (setup (str "readelf -d failed on " f))))
+(define ver (or (readelf "-VW") ""))
+(define (field text re) (let ((m (regex-search re text))) (and m (trim (match-group m 1)))))
+(define interp (or (field hdr "Requesting program interpreter: ([^\\]]*)\\]")
+                   (setup (str "no interpreter found in " f " (not a dynamic ELF executable?)"))))
+(define bad #f)
+(define (fail fmt . xs) (println "FAIL ~a" (apply format (cons fmt xs))) (set! bad #t))
+(define machine (or (field elfh "(?m)^ *Machine: *(.*)$") "unknown"))
+(define class (or (field elfh "(?m)^ *Class: *(.*)$") "unknown"))
+(println "machine ~a ~a" machine class)
+(unless (contains? machine "X86-64") (fail "not an x86-64 executable"))
+(unless (equal? class "ELF64") (fail "not a 64-bit ELF"))
+(println "interpreter ~a" interp)
+(unless (equal? interp "/lib64/ld-linux-x86-64.so.2") (fail "interpreter is not /lib64/ld-linux-x86-64.so.2"))
+(let ((store (filter (lambda (l) (contains? l "/gnu/store")) (split dyn "\n"))))
+  (unless (null? store)
+    (fail "the dynamic section names a /gnu/store path:")
+    (each l store (println "~a" l))))
+(define glibc-libs '("libc.so.6" "libm.so.6" "libdl.so.2" "libpthread.so.0" "librt.so.1" "libutil.so.1"
+                     "libresolv.so.2" "libanl.so.1" "ld-linux-x86-64.so.2"))
+(define needed (map (lambda (m) (match-group m 1)) (regex-match-all "\\(NEEDED\\)[^\\[]*\\[([^\\]]*)\\]" dyn)))
+(when (null? needed) (setup "no NEEDED entries read"))
+(each n needed
+  (if (member n glibc-libs) (println "needed ~a" n) (fail "needs ~a, which is not part of glibc" n)))
+;; versions compared numerically, part by part
+(define (vparts v) (map string->number (split v ".")))
+(define (v<? a b)
+  (let loop ((x (vparts a)) (y (vparts b)))
+    (cond ((null? y) #f) ((null? x) #t) ((< (car x) (car y)) #t) ((> (car x) (car y)) #f) (else (loop (cdr x) (cdr y))))))
+(define floor
+  (let* ((vs (map (lambda (m) (match-group m 1)) (regex-match-all "GLIBC_([0-9]+(\\.[0-9]+)*)" ver)))
+         (vs (if (contains? ver "GLIBC_ABI_DT_RELR") (cons "2.36" vs) vs)))
+    (let loop ((xs vs) (best #f)) (if (null? xs) best (loop (cdr xs) (if (or (not best) (v<? best (car xs))) (car xs) best))))))
+(println "glibc-floor ~a" (or floor "unknown"))
+(define max (let ((m (getenv "GLIBC_MAX"))) (if (and m (regex-match? "[0-9]+\\.[0-9]+" m)) m "2.35")))
+(cond ((not floor) (fail "no GLIBC_ symbol versions read, so the floor is unknown"))
+      ((v<? max floor)
+       (fail "needs glibc ~a, newer than the ~a the downloads promise (~a)" floor max
+             (if (getenv "GLIBC_MAX") "GLIBC_MAX" "Ubuntu 22.04"))))
+(if bad (exit 1) (begin (println "PASS portable") (exit 0)))

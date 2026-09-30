@@ -1,0 +1,177 @@
+;;; cloudflare-setup [--create | --domain] - the one-time Cloudflare account
+;;; changes a game's site needs. THE ACCOUNT OWNER RUNS THIS; automation does not create
+;;; projects or DNS records. Ported from the games' sh scripts; every name
+;;; comes from substratic.sgv.
+;;;
+;;;   sgx substratic:cloudflare-setup            report only: what exists, what each
+;;;                                              step would do (no writes)
+;;;   sgx substratic:cloudflare-setup --create   create the Pages project (production
+;;;                                              branch from the config) and the private
+;;;                                              R2 bucket, each only if missing. Nothing
+;;;                                              is public after this
+;;;   sgx substratic:cloudflare-setup --domain   attach the config's domains to the
+;;;                                              project and create their proxied CNAMEs
+;;;                                              to its pages.dev name where no record
+;;;                                              exists. Refuses before the first
+;;;                                              production deployment, and where a name
+;;;                                              already points somewhere else
+;;;
+;;; The credential: the environment, else the config's pass entry. Every API
+;;; call gets the token through a curl config file in a mode-700 scratch
+;;; directory (never on a command line); every wrangler call runs from an
+;;; empty scratch directory (wrangler 4 edits the config it finds in its cwd:
+;;; measured 2026-09-24) with HOME pointed there too (so a `wrangler
+;;; login` on this machine is never used). A bucket-scoped token cannot see
+;;; buckets: "cannot tell" is a third answer, never read as "missing, create
+;;; it". CLOUDFLARE_API_BASE overrides the API (the tests use a mock).
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (sigil json) (substratic tasks common) (substratic tasks config) (substratic tasks credentials))
+(requires (tools curl chmod))
+(set-task-name! "cloudflare-setup")
+
+(define args (script-args))
+(define mode (cond ((null? args) 'report)
+                   ((and (= (length args) 1) (equal? (car args) "--create")) 'create)
+                   ((and (= (length args) 1) (equal? (car args) "--domain")) 'domain)
+                   (else (usage-error "unknown argument ~a (none, --create or --domain)" (car args)))))
+(define api (or (getenv "CLOUDFLARE_API_BASE") "https://api.cloudflare.com/client/v4"))
+
+(define (main)
+  (let* ((root (project-dir))
+         (config (read-config root))
+         (project (cfg config "publish" "pages" "project"))
+         (prod (cfg config "publish" "pages" "production-branch"))
+         (bucket (cfg config "publish" "wasm" "bucket"))
+         (zone-name (cfg config "publish" "pages" "zone"))
+         (domains (cfg config "publish" "pages" "domains"))
+         (cred (resolve-credentials config))
+         (acct (credential-account cred)))
+    (with-temp-dir scratch
+      ($ chmod 700 ,scratch)
+      ;; the token reaches curl as a config on stdin (-K -): never argv, never a file
+      (define api-cfg (str "header = \"Authorization: Bearer " (credential-token cred) "\"\n"))
+      ;; one API call -> the decoded reply (a dict), or #f when there is no JSON.
+      ;; The verb is one of two literals, never a variable passed to curl (the
+      ;; delete tripwire, test/test-no-deletes.sgl, refuses a variable method).
+      (define (call method route . body)
+        (let* ((verb (cond ((equal? method "GET") (list "--get"))
+                           ((equal? method "POST") (list "-X" "POST"))
+                           (else (refuse "cloudflare-setup only reads and creates; no ~a" method))))
+               (r ($? curl -sS --connect-timeout 20 --max-time 60 -K - ,@verb
+                      ,@(if (pair? body)
+                            (list "-H" "Content-Type: application/json" "--data" (car body))
+                            '())
+                      ,(str api route) in: ,api-cfg)))
+          (guard (e (#t #f)) (json-decode (stdout-of r)))))
+      (define (ok-reply? d) (and (dict? d) (equal? (dict-ref d success: #f) #t)))
+      (define (errors-of d) (if (dict? d) (redact cred (json-encode (dict-ref d errors: '()))) "no JSON reply"))
+      ;; a call that must succeed
+      (define (api! method route . body)
+        (let ((d (apply call (cons method (cons route body)))))
+          (unless (ok-reply? d) (refuse "API ~a ~a refused: ~a" method route (errors-of d)))
+          d))
+      (define (result d) (dict-ref d result: #f))
+      (define (wrangler! . argv)
+        (require-tools! '("wrangler"))
+        (ensure-directory (path scratch "wrangler-home"))
+        (let ((r ($? wrangler ,@argv cwd: ,(path scratch "wrangler-home") err: 'merge timeout: 300
+                     env: ,(append (credential-env cred)
+                                   (list (cons "HOME" (path scratch "wrangler-home")) (cons "XDG_CONFIG_HOME" (path scratch "wrangler-home"))
+                                         (cons "WRANGLER_SEND_METRICS" "false"))))))
+          (display (redact cred (stdout-of r)))
+          (unless (ok? r) (refuse "wrangler ~a failed (rc ~a)" (string-join argv " ") (exit-status r)))))
+
+      (say "account <account>, project ~a, bucket ~a, mode ~a" project bucket mode)
+      (let* ((proj (call "GET" (str "/accounts/" acct "/pages/projects/" project)))
+             (have-project (cond ((ok-reply? proj) #t)
+                                 ;; only "project not found" means missing; an auth
+                                 ;; or network failure must not read as "create it"
+                                 ((and (dict? proj) (any-code? (dict-ref proj errors: (list->array (quote ()))) 8000007)) #f)
+                                 (else (refuse "cannot read Pages project ~a: ~a" project (errors-of proj)))))
+             (target (and have-project (dict-ref (result proj) subdomain: #f))))
+        (if have-project
+            (say "Pages project ~a exists: production branch ~a, ~a, domains ~a" project
+                 (dict-ref (result proj) production_branch: "?") target
+                 (string-join (map (lambda (x) x) (array->list (dict-ref (result proj) domains: (list->array '())))) " "))
+            (say "Pages project ~a does not exist (~a)" project (errors-of proj)))
+        (let* ((b (call "GET" (str "/accounts/" acct "/r2/buckets/" bucket)))
+               (have-bucket (cond ((ok-reply? b) 'yes)
+                                  ((and (dict? b)
+                                        (any-code? (dict-ref b errors: (list->array '())) 10006))
+                                   'no)
+                                  (else 'unknown))))
+          (case have-bucket
+            ((yes) (say "R2 bucket ~a exists" bucket))
+            ((no) (say "R2 bucket ~a does not exist" bucket))
+            (else (say "R2 bucket ~a: unknown to this token (~a); a bucket-scoped token cannot see buckets"
+                       bucket (errors-of b))))
+          (cond
+            ((eq? mode 'create)
+             (unless have-project
+               (wrangler! "pages" "project" "create" project "--production-branch" prod)
+               (say "created Pages project ~a (no deployment, no custom domain: nothing is public)" project))
+             (case have-bucket
+               ((no) (wrangler! "r2" "bucket" "create" bucket)
+                     (say "created R2 bucket ~a (private: only the Pages Function reads it)" bucket))
+               ((unknown) (say "NOT creating R2 bucket ~a: this token cannot tell whether it exists. Creating a bucket needs an account-wide R2 Storage Edit token" bucket)))
+             (say "next: sgx substratic:publish-web DIR \"<line>\" --preview, checked on its pages.dev URL"))
+            (else
+             (let* ((zones (result (api! "GET" (str "/zones?name=" zone-name))))
+                    (zone-id (and zones (> (array-length zones) 0) (dict-ref (array-ref zones 0) id: #f))))
+               (unless zone-id (refuse "no zone ~a visible to this token" zone-name))
+               (define (records d)
+                 (array->list (result (api! "GET" (str "/zones/" zone-id "/dns_records?name=" d)))))
+               (define (addr-records d)
+                 (filter (lambda (r) (member (dict-ref r type: "") '("A" "AAAA" "CNAME"))) (records d)))
+               (say "zone ~a is ~a; its records for the site's names:" zone-name zone-id)
+               (each d domains
+                 (let ((rs (records d)))
+                   (say "  ~a: ~a" d (if (null? rs) "none"
+                                         (string-join (map (lambda (r) (format "~a ~a -> ~a proxied=~a" (dict-ref r type: "")
+                                                                               (dict-ref r name: "") (dict-ref r content: "")
+                                                                               (dict-ref r proxied: #f)))
+                                                           rs)
+                                                      "; ")))))
+               (if (eq? mode 'report)
+                   (begin
+                     (say "report only. --create would make the project and the bucket if missing; --domain would attach ~a"
+                          (string-join domains " "))
+                     (say "to ~a and create proxied CNAMEs to ~a where no record exists (and refuse where one does)"
+                          project (or target "<its pages.dev name>")))
+                   ;; --domain
+                   (begin
+                     (unless have-project (refuse "the project does not exist; --create first"))
+                     (unless (and (string? target) (ends-with? target ".pages.dev"))
+                       (refuse "cannot read the project's pages.dev name ('~a')" target))
+                     (let ((deploys (result (api! "GET" (str "/accounts/" acct "/pages/projects/" project "/deployments?env=production")))))
+                       (unless (and deploys (> (array-length deploys) 0))
+                         (refuse "~a has no production deployment yet; publish and check it on ~a first" project target)))
+                     (each d domains
+                       (let ((existing (addr-records d)))
+                         (unless (or (null? existing)
+                                     (and (= (length existing) 1)
+                                          (equal? (dict-ref (car existing) type: "") "CNAME")
+                                          (equal? (dict-ref (car existing) content: "") target)))
+                           (refuse "~a already points somewhere (~a); not replacing it" d
+                                   (string-join (map (lambda (r) (str (dict-ref r type: "") " " (dict-ref r content: ""))) existing) ", ")))))
+                     (each d domains
+                       (if (member d (array->list (dict-ref (result proj) domains: (list->array '()))))
+                           (say "~a is already attached to ~a" d project)
+                           (begin
+                             (api! "POST" (str "/accounts/" acct "/pages/projects/" project "/domains")
+                                   (json-encode (dict "name" d)))
+                             (say "attached ~a to ~a" d project)))
+                       (when (null? (addr-records d))
+                         (api! "POST" (str "/zones/" zone-id "/dns_records")
+                               (json-encode (dict "type" "CNAME" "name" d "content" target "proxied" #t
+                                                  "comment" (str d " on Pages (substratic cloudflare-setup)"))))
+                         (say "created CNAME ~a -> ~a (proxied)" d target)))
+                     (say "done. Cloudflare validates the domains and issues certificates (minutes); then")
+                     (say "sgx substratic:verify-live https://~a <the staged DIR that was published>" (car domains)))))))))))
+  0)
+
+(define (any-code? errs code)
+  (let loop ((xs (if (array? errs) (array->list errs) '())))
+    (and (pair? xs) (or (and (dict? (car xs)) (equal? (dict-ref (car xs) code: #f) code)) (loop (cdr xs))))))
+
+(exit (with-refusals main))

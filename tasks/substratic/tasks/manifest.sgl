@@ -1,0 +1,109 @@
+;;; (substratic tasks manifest) - the identity of a deploy.
+;;;
+;;; One "sha256  path" line per file under DIR (the staged tree, as
+;;; `wrangler pages deploy` uploads it), sorted by path in byte order, then
+;;; one "sha256  @path" line per file of what else the deploy carries, read
+;;; from ROOT: functions/ (the wasm route), sorted the same way, then the
+;;; wrangler config (wrangler.json or wrangler.jsonc, exactly one). This is
+;;; the games' scripts/tree-manifest, line for line: the same input gives the
+;;; same bytes (tasks/test/test-tree-manifest.sgl compares them).
+;;;
+;;; REFUSES (raises a refusal, no lines) when DIR or functions/ holds
+;;; anything but regular files and directories (`find -type f` skipped a
+;;; symlink and wrangler's upload follows it, so two trees with different
+;;; link targets would share a manifest), when a path has a character that
+;;; sha256sum would escape (a newline or a backslash), or when a Function
+;;; imports anything (what it imports would not be hashed here).
+
+(define-library (substratic tasks manifest)
+  (import (sigil shell prelude) (sigil list) (substratic tasks common))
+  (export tree-manifest
+          manifest-body
+          manifest-header-ref
+          manifest-entries)
+  (begin
+
+    ;; Every regular file under DIR, as paths relative to DIR. ODD collects
+    ;; what is neither a regular file nor a directory.
+    (define (walk dir)
+      (let ((files '()) (odd '()))
+        (let visit ((rel ""))
+          (let* ((abs (if (equal? rel "") dir (path dir rel)))
+                 (names (directory-list abs)))
+            (unless names (refuse "cannot list ~a" abs))
+            (for-each
+              (lambda (name)
+                (let* ((r (if (equal? rel "") name (str rel "/" name)))
+                       (st (file-stat (path dir r) #f))
+                       (type (and st (stat-type st))))
+                  (cond ((eq? type 'regular) (set! files (cons r files)))
+                        ((eq? type 'directory) (visit r))
+                        (else (set! odd (cons (path dir r) odd))))))
+              names)))
+        (values (list-sort string<? files) (reverse odd))))
+
+    (define (check-names where rels)
+      (for-each (lambda (r)
+                  (when (or (contains? r "\n") (contains? r "\\"))
+                    (refuse "a path sha256sum would escape (a newline or a backslash) in ~a: ~s" where r)))
+                rels))
+
+    (define import-pattern "(?m)^[\\t\\n\\v\\f\\r ]*import[\\t\\n\\v\\f\\r (]|require\\(|import\\(")
+
+    ;; DIR's manifest lines (a list of strings) with ROOT's functions/ and
+    ;; wrangler config.
+    (define (tree-manifest dir root)
+      (unless (directory? dir) (refuse "~a is not a directory (give the staged directory)" dir))
+      ;; find(1) does not follow a symlinked starting point either
+      (when (symlink? dir) (refuse "not a regular file or directory (a symlink?): ~a" dir))
+      (let ((fdir (path root "functions")))
+        (unless (directory? fdir) (refuse "~a missing (the wasm route)" fdir))
+        (when (symlink? fdir) (refuse "not a regular file or directory (a symlink?): ~a" fdir))
+        (let* ((wj (file? (path root "wrangler.json")))
+               (wjc (file? (path root "wrangler.jsonc")))
+               (wname (cond ((and wj wjc) (refuse "~a holds both wrangler.json and wrangler.jsonc" root))
+                            (wj "wrangler.json")
+                            (wjc "wrangler.jsonc")
+                            (else (refuse "~a/wrangler.json (or .jsonc) missing" root)))))
+          (let-values (((tree-files tree-odd) (walk dir))
+                       ((fn-files fn-odd) (walk fdir)))
+            (let ((odd (append tree-odd fn-odd)))
+              (unless (null? odd)
+                (refuse "not a regular file or directory (a symlink?): ~a"
+                        (string-join (list-head* odd 5) " "))))
+            (check-names dir tree-files)
+            (check-names fdir fn-files)
+            (let ((importers (filter (lambda (f)
+                                       (regex-search import-pattern (read-text (path fdir f))))
+                                     fn-files)))
+              (unless (null? importers)
+                (refuse "a Function imports something this manifest does not hash: ~a"
+                        (string-join (map (lambda (f) (path fdir f)) importers) " "))))
+            (append
+              (map (lambda (f) (str (file-sha256 (path dir f)) "  " f)) tree-files)
+              (map (lambda (f) (str (file-sha256 (path fdir f)) "  @functions/" f)) fn-files)
+              (list (str (file-sha256 (path root wname)) "  @" wname)))))))
+
+    (define (list-head* xs n)
+      (if (or (null? xs) (= n 0)) '() (cons (car xs) (list-head* (cdr xs) (- n 1)))))
+
+    ;; A manifest file's non-header lines, joined with newlines (what the
+    ;; sh scripts compared: `grep -v '^#'`, blank lines dropped).
+    (define (manifest-body file)
+      (string-join (filter (lambda (l) (and (not (equal? l "")) (not (starts-with? l "#"))))
+                           (split (read-text file) "\n"))
+                   "\n"))
+
+    ;; The value of a "# KEY value" header line, or #f.
+    (define (manifest-header-ref file key)
+      (let loop ((ls (split (read-text file) "\n")))
+        (cond ((null? ls) #f)
+              ((starts-with? (car ls) (str "# " key " "))
+               (substring (car ls) (+ 3 (string-length key)) (string-length (car ls))))
+              (else (loop (cdr ls))))))
+
+    ;; The body as (hash . path) pairs.
+    (define (manifest-entries file)
+      (map (lambda (l) (cons (substring l 0 64) (substring l 66 (string-length l))))
+           (filter (lambda (l) (> (string-length l) 66))
+                   (split (manifest-body file) "\n"))))))

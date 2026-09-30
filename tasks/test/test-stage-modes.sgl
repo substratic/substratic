@@ -1,0 +1,151 @@
+;;; test-stage-modes - stage-web, check-site and publish-web --dry-run in the
+;;; modes a public site uses and test-publish does not: copy: tracked, a
+;;; stage-hook:, indexing: index, wasm: noindex:, a variable mount; and the
+;;; refusals that come with them. A throwaway git game; no network.
+;;; TASKS=<dir> runs another copy of tasks/. Last line is VERDICT.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+(define n 0)
+(define failed 0)
+(define last-out "")
+(define (check name ok)
+  (set! n (+ n 1))
+  (if ok (println "PASS ~a" name)
+      (begin (set! failed (+ failed 1)) (println "FAIL ~a" name)
+             (each l (let ((ls (split last-out "\n"))) (if (> (length ls) 6) (list-tail ls (- (length ls) 6)) ls))
+               (println "    | ~a" l)))))
+(define (setup-failed why) (println "SETUP-FAILED: ~a" why) (exit 2))
+
+(define work (make-temp-directory))
+(define game (path work "game"))
+(define (w rel text) (ensure-directory (dirname (path game rel))) (write-text (path game rel) text))
+(define (git . args) ($ git -c user.email=t@t -c user.name=t ,@args cwd: ,game))
+(define extra-env '())
+(define (task name . args)
+  (let ((r ($? sigil ,(path tasks-dir (str name ".sgl")) ,@args cwd: ,game err: 'merge timeout: 900
+               env: ,(append extra-env (list (cons "CLOUDFLARE_API_TOKEN" "") (cons "CLOUDFLARE_ACCOUNT_ID" ""))))))
+    (set! last-out (stdout-of r))
+    (exit-status r)))
+(define (says? s) (contains? last-out s))
+(define (restage)
+  (each s '("" ".manifest" ".verified" ".pages") ($ rm -rf ,(path game (str "build/site" s))))
+  (task "stage-web" "build/site"))
+(define (with-file rel text thunk)
+  (let* ((f (path game rel)) (old (and (file? f) (read-text f))))
+    (write-text f text)
+    (thunk)
+    (if old (write-text f old) (when (file-exists? f) (delete-file f)))))
+
+(define config
+  (str "(substratic schema: 1)\n"
+       "(publish credentials: (pass \"cloudflare/fakegame-site\")\n"
+       "  pages: (project: \"fakegame\" production-branch: \"master\" preview-branch: \"preview\"\n"
+       "          domains: (\"fakegame.test\") zone: \"fakegame.test\" compatibility-date: \"2026-07-14\")\n"
+       "  wasm: (bucket: \"fakegame-wasm\" binding: \"WASM\" route: \"w\" noindex: yes)\n"
+       "  apps: ((name: \"fakegame\" web: (dir: \"build/web\" env: \"FAKE_WEB\")\n"
+       "          mount: (env: \"FAKE_MOUNT\" file: \"~/.config/no-such-fakegame/mount\" default: \"play\" pattern: \".*\")))\n"
+       "  indexing: index\n"
+       "  site: (source: \"site\" copy: tracked required: (\"index.html\" \"404.html\" \"robots.txt\") refuse: (\"version.json\" \"news\"))\n"
+       "  stage-hook: (argv: (\"node\" \"scripts/hook.mjs\" \"{dir}\" \"{version}\" \"{stamp}\") outputs: (\"version.json\") inputs: (\"news\"))\n"
+       "  check: (arm: \"scripts/arm.mjs\"))\n"))
+
+(dynamic-wind
+  (lambda () #f)
+  (lambda ()
+    (w "package.sgl" "(package name: \"fakegame\" version: \"1.2.3\" sigil: \"0.22.7\" description: \"a test game\" license: \"MIT\")\n")
+    (w "substratic.sgv" config)
+    (w "site/index.html" "<!doctype html><title>fake</title><a href=\"/play/\">play</a>\n")
+    (w "site/404.html" "<!doctype html><meta name=\"robots\" content=\"noindex\"><title>404</title>\n")
+    (w "site/robots.txt" "User-agent: *\nAllow: /\n")
+    (w "site/_headers" "/*\n  X-Content-Type-Options: nosniff\n")
+    (w "site/deep/page.html" "<!doctype html><title>deep</title>\n")
+    (w "news/first.md" "# first\n")
+    (w "scripts/hook.mjs" (str "import fs from 'node:fs';\n"
+                               "const [dir, version, stamp] = process.argv.slice(2);\n"
+                               "if (process.env.HOOK_FAIL) process.exit(3);\n"
+                               "if (!process.env.HOOK_SKIP) fs.writeFileSync(dir + '/version.json', JSON.stringify({ version, stamp }) + '\\n');\n"))
+    (w "scripts/arm.mjs" (str "const [B] = process.argv.slice(2);\n"
+                              "const page = await (await fetch(B + '/play/')).text();\n"
+                              "const m = page.match(/data-wasm=\"([^\"]+)\"/);\n"
+                              "const r = await fetch(B + m[1] + '.wasm');\n"
+                              "console.log(r.status === 200 ? '  ok   arm: wasm served' : '  FAIL arm: ' + r.status); process.exit(r.status === 200 ? 0 : 1);\n"))
+    (w ".gitignore" "build/\n")
+    (w "build/web/index.html" "<!doctype html><canvas data-wasm=\"fakegame\"></canvas>\n")
+    ($ sh -c "head -c 50000 /dev/urandom > build/web/fakegame.wasm" cwd: ,game)
+    (w "build/web/assets/a.txt" "an asset\n")
+    (unless (ok? ($? sigil deps install cwd: ,game)) (setup-failed "sigil deps install in the fake game"))
+    ($ git init -q cwd: ,game)
+    (git "add" "-A")
+    (git "commit" "-qm" "fake")
+    (write-text (path game "site" "untracked.html") "<p>not committed</p>\n")
+
+    ;; ---- the good path
+    (check "stage (tracked, hook, index): rc 0" (= 0 (restage)))
+    (check "  the hook ran with the package version and a local stamp"
+           (let ((v (read-text (path game "build/site/version.json") missing: "")))
+             (and (contains? v "\"1.2.3\"") (contains? v "local-"))))
+    (check "  tracked files are staged, deep ones too" (file? (path game "build/site/deep/page.html")))
+    (check "  an UNTRACKED file in site/ is not staged" (not (file-exists? (path game "build/site/untracked.html"))))
+    (check "  the manifest says index and clean"
+           (let ((m (read-text (path game "build/site.manifest"))))
+             (and (contains? m "# indexing index\n") (contains? m "# clean yes\n"))))
+    (check "  the Function says noindex though the site is indexed (wasm: noindex: yes)"
+           (contains? (read-text (path game "build/site.pages/functions/w/[[path]].js")) "x-robots-tag"))
+    (check "check-site (index mode): GREEN" (and (= 0 (task "check-site" "build/site")) (says? "ok   indexable") (says? "allows everything")))
+    (check "publish-web --dry-run: rc 0" (= 0 (task "publish-web" "build/site" "--dry-run")))
+
+    ;; ---- index-mode legs go red
+    (with-file "site/deep/page.html" "<!doctype html><meta content=\"noindex\" name=\"robots\"><title>deep</title>\n"
+      (lambda () (git "commit" "-qam" "noindex page") (restage)
+        (check "check-site: a page asking noindex is RED" (and (= 1 (task "check-site" "build/site")) (says? "asks not to be indexed")))))
+    (git "commit" "-qam" "back")
+    (with-file "site/_headers" "/*\n  X-Robots-Tag: noindex\n"
+      (lambda () (git "commit" "-qam" "noindex header") (restage)
+        (check "check-site: an X-Robots-Tag noindex header is RED" (and (= 1 (task "check-site" "build/site")) (says? "served with X-Robots-Tag: noindex")))))
+    (git "commit" "-qam" "back")
+    (with-file "site/404.html" "<!doctype html><title>404</title>\n"
+      (lambda () (git "commit" "-qam" "404 indexable") (restage)
+        (check "check-site: a 404 that does not ask noindex is RED" (and (= 1 (task "check-site" "build/site")) (says? "404.html does not ask")))))
+    (git "commit" "-qam" "back")
+    (with-file "site/robots.txt" "User-agent: *\nDisallow: /\n"
+      (lambda () (git "commit" "-qam" "robots") (restage)
+        (check "check-site: robots.txt disallowing is RED in index mode" (and (= 1 (task "check-site" "build/site")) (says? "FAIL robots")))))
+    (git "commit" "-qam" "back")
+
+    ;; ---- stage refusals
+    (set! extra-env (list (cons "HOOK_FAIL" "1")))
+    (check "stage: a failing hook is refused" (and (= 1 (restage)) (says? "the stage hook")))
+    (set! extra-env (list (cons "HOOK_SKIP" "1")))
+    (check "stage: a hook that writes no declared output is refused" (and (= 1 (restage)) (says? "wrote no version.json")))
+    (set! extra-env '())
+    (write-text (path game "news" "draft.md") "# draft\n")
+    (check "stage: an untracked file in the hook's inputs is refused" (and (= 1 (restage)) (says? "untracked files in news/")))
+    (delete-file (path game "news" "draft.md"))
+    (with-file "site/version.json" "{}\n"
+      (lambda () (git "add" "site/version.json") (git "commit" "-qm" "stray")
+        (check "stage: a refuse: name in the source is refused" (and (= 1 (restage)) (says? "is generated or staged")))
+        (git "rm" "-q" "site/version.json") (git "commit" "-qm" "unstray")))
+    (git "rm" "-q" "site/robots.txt") (git "commit" "-qm" "no robots")
+    (check "stage: a required: file missing is refused" (and (= 1 (restage)) (says? "robots.txt missing")))
+    (git "revert" "--no-edit" "HEAD")
+    (set! extra-env (list (cons "FAKE_MOUNT" "x/../..")))
+    (check "stage: a mount that is not a plain name is refused, whatever the pattern" (and (= 1 (restage)) (says? "does not match")))
+    (set! extra-env '())
+
+    ;; ---- publish refusals new with the review
+    (write-text (path game "site/index.html") "<!doctype html><title>edited</title><a href=\"/play/\">play</a>\n")
+    (restage)
+    (git "checkout" "--" "site/index.html")
+    (task "check-site" "build/site")
+    (check "publish: a tree staged from tracked changes is refused (even after the revert)"
+           (and (= 1 (task "publish-web" "build/site" "--dry-run")) (says? "staged from a checkout with tracked changes")))
+    (write-text (path game "build/web/BUILD-SHA") "0123456789abcdef0123456789abcdef01234567\n")
+    (restage)
+    (task "check-site" "build/site")
+    (check "publish: a runner build of another commit is refused"
+           (and (= 1 (task "publish-web" "build/site" "--dry-run")) (says? "was built at 0123456789ab")))
+    (delete-file (path game "build/web/BUILD-SHA")))
+  (lambda ()
+    (if (= failed 0) ($ rm -rf ,work) (eprintln "test-stage-modes: evidence in ~a" work))))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

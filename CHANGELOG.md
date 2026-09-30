@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `tasks/`: the games' site tooling, shared, in Sigil shell: `build-remote`,
+  `stage-web`, `check-site`, `publish-web`, `verify-live`, `pages-dev-check`,
+  `cloudflare-setup`, `host-site`, `tree-manifest` and `r2-s3`. A game
+  configures them in a `substratic.sgv` at its root (read as data; an
+  unknown key is refused) and runs them as `sgx substratic:<task>` from
+  Sigil 0.22.11, or by path before that. They generate the Pages Function
+  and `wrangler.json`, take the Cloudflare token from the environment or
+  from the pass entry the config names, never delete anything remote, and
+  never pass a credential on a command line. `tasks/README.md` has the path
+  from a commit to the site. Nothing in `tasks/` is compiled into a game.
+
 ## 0.2.3 (2026-09-29)
 
 - `substratic.js`: a browser without WebGL 2 no longer gets the loader's

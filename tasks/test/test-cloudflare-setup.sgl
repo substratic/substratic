@@ -1,0 +1,139 @@
+;;; test-cloudflare-setup - cloudflare-setup against a local API mock
+;;; (test/cloudflare-api-mock.cjs), a stub wrangler and a curl shim that
+;;; records every argv: no network, no token, nothing created.
+;;; TASKS=<dir> runs another copy of tasks/. Last line is VERDICT.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+(define token "tok-cf-setup-KK3")
+(define n 0)
+(define failed 0)
+(define last-out "")
+(define (check name ok)
+  (set! n (+ n 1))
+  (if ok (println "PASS ~a" name)
+      (begin (set! failed (+ failed 1)) (println "FAIL ~a" name)
+             (each l (split last-out "\n") (println "    | ~a" l)))))
+(define (setup-failed why) (println "SETUP-FAILED: ~a" why) (exit 2))
+
+(define work (make-temp-directory))
+(define game (path work "game"))
+(define bin (path work "bin"))
+(define state (path work "state.json"))
+(define mock #f)
+(define port #f)
+(define (log-text f) (if (file? f) (read-text f) ""))
+
+(define (set-state! text) (write-text state text))
+(define (run . args)
+  (write-text (path work "mock.log.mark") (log-text (path work "mock.log")))
+  (write-text (path work "wrangler.log") "")
+  (let ((r ($? sigil ,(path tasks-dir "cloudflare-setup.sgl") ,@args cwd: ,game err: 'merge timeout: 120
+               env: ,(list (cons "PATH" (str bin ":" (getenv "PATH"))) (cons "STUB_DIR" work)
+                           (cons "CLOUDFLARE_API_TOKEN" token) (cons "CLOUDFLARE_ACCOUNT_ID" "acct")
+                           (cons "CLOUDFLARE_API_BASE" (str "http://127.0.0.1:" port))))))
+    (set! last-out (stdout-of r))
+    (exit-status r)))
+;; the mock's lines since the last run started
+(define (new-requests)
+  (let ((all (log-text (path work "mock.log"))) (mark (log-text (path work "mock.log.mark"))))
+    (substring all (string-length mark) (string-length all))))
+(define (posts) (length (filter (lambda (l) (starts-with? l "POST ")) (split (new-requests) "\n"))))
+(define (says? s) (contains? last-out s))
+(define (wrangler-log) (log-text (path work "wrangler.log")))
+
+(define base-state
+  "{\"project\": {\"subdomain\": \"fakegame-1ab.pages.dev\", \"production_branch\": \"master\", \"domains\": []}, \"deployments\": 1, \"bucket\": \"yes\", \"zone\": \"fakegame.test\", \"records\": {}}")
+
+(dynamic-wind
+  (lambda () #f)
+  (lambda ()
+    (ensure-directory game)
+    (ensure-directory bin)
+    (write-text (path game "package.sgl") "(package name: \"fakegame\" version: \"0.0.1\" sigil: \"0.22.7\" description: \"a test game\" license: \"MIT\")\n")
+    (write-text (path game "substratic.sgv")
+                (str "(substratic schema: 1)\n"
+                     "(publish credentials: (pass \"cloudflare/fakegame-site\")\n"
+                     "  pages: (project: \"fakegame\" production-branch: \"master\" preview-branch: \"preview\"\n"
+                     "          domains: (\"fakegame.test\" \"www.fakegame.test\") zone: \"fakegame.test\" compatibility-date: \"2026-07-14\")\n"
+                     "  wasm: (bucket: \"fakegame-wasm\" binding: \"WASM\" route: \"w\")\n"
+                     "  apps: ((name: \"fakegame\" web: (dir: \"build/web\") mount: \"play\"))\n"
+                     "  indexing: noindex\n"
+                     "  site: (source: \"site\" files: (\"index.html\")))\n"))
+    (unless (ok? ($? sigil deps install cwd: ,game)) (setup-failed "sigil deps install in the fake game"))
+    (write-text (path bin "wrangler")
+                (str "#!/bin/sh\necho \"wrangler $* | cwd $(pwd) | home $HOME | files $(ls -A | tr '\\n' ' ')\" >> \"$STUB_DIR/wrangler.log\"\n"))
+    (let ((real-curl (out sh -c "command -v curl")))
+      (write-text (path bin "curl") (str "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STUB_DIR/curl-argv.log\"\nexec " real-curl " \"$@\"\n")))
+    ($ chmod +x ,(path bin "wrangler") ,(path bin "curl"))
+    (set-state! base-state)
+    (set! mock (spawn node ,(path tasks-dir "test" "cloudflare-api-mock.cjs") 0 ,token ,state
+                      out: ,(path work "mock.log") err: 'merge))
+    (wait-until (contains? (log-text (path work "mock.log")) "listening") timeout: 10 interval: 0.1
+                message: "the API mock did not start")
+    (set! port (car (split (cadr (split (log-text (path work "mock.log")) "listening ")) "\n")))
+
+    ;; report
+    (check "report, all there: rc 0, no writes"
+           (and (= 0 (run)) (says? "Pages project fakegame exists") (says? "R2 bucket fakegame-wasm exists")
+                (says? "report only") (= 0 (posts)) (equal? "" (wrangler-log))))
+    (set-state! "{\"project\": null, \"bucket\": \"no\", \"zone\": \"fakegame.test\"}")
+    (check "report, nothing there: says so, no writes"
+           (and (= 0 (run)) (says? "does not exist") (says? "R2 bucket fakegame-wasm does not exist")
+                (= 0 (posts)) (equal? "" (wrangler-log))))
+    ;; create
+    (check "create, both missing: wrangler creates both, from an empty scratch dir with a scratch HOME"
+           (and (= 0 (run "--create"))
+                (contains? (wrangler-log) "wrangler pages project create fakegame --production-branch master")
+                (contains? (wrangler-log) "wrangler r2 bucket create fakegame-wasm")
+                (not (contains? (wrangler-log) (str "cwd " game)))
+                (let ((m (regex-search "cwd (\\S+) \\| home (\\S+) \\| files (.*)" (wrangler-log))))
+                  (and m (equal? (match-group m 1) (match-group m 2))
+                       (not (contains? (match-group m 3) "wrangler"))
+                       (not (contains? (match-group m 3) "api.cfg"))))))
+    (set-state! "{\"project\": null, \"bucket\": \"unknown\", \"zone\": \"fakegame.test\"}")
+    (check "create, the token cannot see buckets: the bucket is NOT created"
+           (and (= 0 (run "--create")) (says? "NOT creating R2 bucket")
+                (not (contains? (wrangler-log) "bucket create")) (contains? (wrangler-log) "project create")))
+    ;; domain refusals
+    (set-state! "{\"project\": null, \"bucket\": \"yes\", \"zone\": \"fakegame.test\"}")
+    (check "domain, no project: refused, no writes" (and (= 1 (run "--domain")) (says? "--create first") (= 0 (posts))))
+    (set-state! (regex-replace "\"deployments\": 1" base-state "\"deployments\": 0"))
+    (check "domain, no production deployment: refused, no writes"
+           (and (= 1 (run "--domain")) (says? "has no production deployment yet") (= 0 (posts))))
+    (set-state! (regex-replace "\"records\": \\{\\}" base-state
+                               "\"records\": {\"www.fakegame.test\": [{\"type\": \"A\", \"name\": \"www.fakegame.test\", \"content\": \"192.0.2.1\", \"proxied\": false}]}"))
+    (check "domain, a name already points elsewhere: refused, no writes"
+           (and (= 1 (run "--domain")) (says? "already points somewhere (A 192.0.2.1)") (= 0 (posts))))
+    (set-state! (regex-replace "\"subdomain\": \"fakegame-1ab.pages.dev\"" base-state "\"subdomain\": \"\""))
+    (check "domain, no pages.dev name: refused, no writes"
+           (and (= 1 (run "--domain")) (says? "cannot read the project's pages.dev name") (= 0 (posts))))
+    ;; domain, the good path
+    (set-state! base-state)
+    (check "domain: attaches both names and creates both CNAMEs"
+           (and (= 0 (run "--domain")) (= 4 (posts))
+                (contains? (new-requests) "body {\"name\":\"fakegame.test\"}")
+                (contains? (new-requests) "\"content\":\"fakegame-1ab.pages.dev\"")))
+    (set-state! (regex-replace "\"domains\": \\[\\]"
+                               (regex-replace "\"records\": \\{\\}" base-state
+                                              "\"records\": {\"fakegame.test\": [{\"type\": \"CNAME\", \"name\": \"fakegame.test\", \"content\": \"fakegame-1ab.pages.dev\", \"proxied\": true}]}")
+                               "\"domains\": [\"fakegame.test\"]"))
+    (check "domain, one name done already: only the other is attached and given a CNAME"
+           (and (= 0 (run "--domain")) (= 2 (posts)) (says? "fakegame.test is already attached")
+                (not (contains? (new-requests) "body {\"name\":\"fakegame.test\"}"))))
+    ;; a failure that is not "not found" must not read as missing
+    (let ((r ($? sigil ,(path tasks-dir "cloudflare-setup.sgl") --create cwd: ,game err: 'merge timeout: 120
+                 env: ,(list (cons "PATH" (str bin ":" (getenv "PATH"))) (cons "STUB_DIR" work)
+                             (cons "CLOUDFLARE_API_TOKEN" "tok-wrong") (cons "CLOUDFLARE_ACCOUNT_ID" "acct")
+                             (cons "CLOUDFLARE_API_BASE" (str "http://127.0.0.1:" port))))))
+      (set! last-out (stdout-of r))
+      (write-text (path work "wrangler.log") (log-text (path work "wrangler.log")))
+      (check "a refused token: refused, never 'does not exist, create it'"
+             (and (= 1 (exit-status r)) (says? "cannot read Pages project") (not (says? "created")))))
+    (check "the token never rode on a curl command line"
+           (and (> (string-length (log-text (path work "curl-argv.log"))) 0)
+                (not (contains? (log-text (path work "curl-argv.log")) token)))))
+  (lambda ()
+    (when mock (when (process-alive? mock) (process-kill! mock)) (process-wait mock))
+    (eprintln "test-cloudflare-setup: evidence in ~a" work)))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

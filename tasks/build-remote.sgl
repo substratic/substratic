@@ -1,0 +1,178 @@
+;;; build-remote [options] - build HEAD on a remote runner (the web config),
+;;; optionally run test files there, and fetch the served tree back. From
+;;; the games' build-remote scripts;
+;;; the runner side is the fixed script tasks/runner/build-web.sh, run with
+;;; arguments. The runner is leased through a helper with azoth-remote's
+;;; interface (--label --timeout --detach --put --get -- COMMAND), named by
+;;; $AZOTH_REMOTE or found on PATH as azoth-remote.
+;;;
+;;;   sgx substratic:build-remote                        build HEAD's web config, fetch it
+;;;   sgx substratic:build-remote --test test/t.sgl      ... and run that test file there
+;;;   sgx substratic:build-remote --no-web --test test/a.sgl --test test/b.sgl
+;;;   sgx substratic:build-remote --no-web --release --command "--floor-reach x" --output build/y
+;;;
+;;;   --test FILE       run a tracked test file (dev config) on the runner; repeatable
+;;;   --no-web          no web build (and nothing to fetch)
+;;;   --no-fetch        build the web config but do not fetch it
+;;;   --release         build the native release config (after the web build)
+;;;   --command "ARGS"  run build/release/bin/<app> ARGS after the builds and
+;;;                     tests (implies --release); one line, split on spaces
+;;;                     on the runner; repeatable
+;;;   --output PATH     fetch the checkout's PATH to build/remote-out-<sha>/PATH
+;;;
+;;; WHAT IS BUILT IS EXACTLY HEAD, OR IT IS REFUSED: a tree with tracked
+;;; changes is refused before anything is leased; the source travels as a git
+;;; bundle of HEAD, checked out at its full sha on the runner, whose checkout
+;;; must stay clean after `sigil deps install` and every build (125
+;;; otherwise); the tree lands in build/remote-web-<sha>/ (refused if it
+;;; exists), with BUILD-SHA naming the commit, only when the cycle ended 0 or
+;;; 1, the runner's completion marker names the sha, and the wasm is there.
+;;;
+;;; Exit: 0 all green; 1 a test, a command or an output copy failed; 2 a
+;;; build failed; 125 refused or SETUP-FAILED; 126/127 from azoth-remote;
+;;; 124/255 timeout / lost. Environment: AZOTH_REMOTE (the lease helper),
+;;; BUILD_TIMEOUT (seconds, default 5400). The runner's
+;;; output streams here as it arrives; its logs land in build/remote-web-<sha>.logs.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks config))
+(requires (tools git bash cp sha256sum))
+(set-task-name! "build-remote")
+
+(define tasks-dir (realpath (script-dir)))
+(define (refused fmt . args) (eprintln "build-remote: ~a" (apply format (cons fmt args))) (exit 125))
+
+;; ---- arguments
+(define tests '())
+(define commands '())
+(define outputs '())
+(define web #t)
+(define release #f)
+(define fetch #t)
+(let loop ((as (script-args)))
+  (unless (null? as)
+    (let ((a (car as)) (next (and (pair? (cdr as)) (cadr as))))
+      (cond ((equal? a "--test") (unless next (refused "--test needs a file"))
+                                 (set! tests (append tests (list next))) (loop (cddr as)))
+            ((equal? a "--no-web") (set! web #f) (set! fetch #f) (loop (cdr as)))
+            ((equal? a "--no-fetch") (set! fetch #f) (loop (cdr as)))
+            ((equal? a "--release") (set! release #t) (loop (cdr as)))
+            ((equal? a "--command") (unless next (refused "--command needs its arguments"))
+                                    (unless (one-line? next) (refused "--command: one line, please (it travels one command per line)"))
+                                    (set! commands (append commands (list next))) (set! release #t) (loop (cddr as)))
+            ((equal? a "--output") (unless next (refused "--output needs a path"))
+                                   (when (or (starts-with? next "/") (contains? next "..") (not (one-line? next)))
+                                     (refused "--output ~a: a path inside the checkout, please" next))
+                                   (set! outputs (append outputs (list next))) (loop (cddr as)))
+            (else (refused "unknown argument '~a'" a))))))
+
+(define (lines-file items) (apply str (map (lambda (x) (str x "\n")) items)))
+
+(define (main)
+  (let* ((root (project-dir))
+         (config (read-config root))
+         (app (cdr (assoc "name" (publish-app config))))
+         (web-config (cfg config "publish" "remote" "web-config")))
+    (each f tests
+      (unless (file? (path root f)) (refused "--test ~a: no such file" f))
+      (unless (ok? ($? git ls-files --error-unmatch ,f cwd: ,root))
+        (refused "--test ~a is not tracked, so it is not in the bundle" f)))
+    (unless (or web release (pair? tests)) (refused "nothing to do (--no-web, no --release, no --test)"))
+    (let ((remote (or (getenv "AZOTH_REMOTE") (let ((r ($? sh -c "command -v azoth-remote"))) (and (ok? r) (trim (stdout-of r)))))))
+      (unless (and remote (file? remote) (executable? remote))
+        (refused "no lease helper: set AZOTH_REMOTE, or put azoth-remote on PATH (~a)" (or remote "not found")))
+      (let ((dirty (out git status --porcelain "--untracked-files=no" cwd: ,root)))
+        (unless (equal? dirty "")
+          (eprintln "build-remote: REFUSED: the tree has tracked changes; the build would not be HEAD's. Commit first.")
+          (eprintln "~a" (string-join (let ((ls (split dirty "\n"))) (if (> (length ls) 5) (list-head ls 5) ls)) "\n"))
+          (exit 125)))
+      (let* ((full (out git rev-parse HEAD cwd: ,root))
+             (sha (substring full 0 12))
+             (dest (path root "build" (str "remote-web-" sha)))
+             (outdest (path root "build" (str "remote-out-" sha)))
+             (sigil-v (let ((m (regex-search "sigil ([0-9]+\\.[0-9]+\\.[0-9]+)" (out sigil --version))))
+                        (if m (match-group m 1) (refused "cannot read this machine's sigil version")))))
+        ;; the runner builds with THIS machine's sigil; a compiler that is not
+        ;; the locked runtime's version is refused by the native build after a
+        ;; lease and ~10 minutes (measured on Phantom 2026-09-26: 0.22.8 and
+        ;; 0.22.9 against a lock on 0.22.7). Say so before leasing anything.
+        (let ((locked (locked-stdlib-version (path root "sigil.lock"))))
+          (when (and locked (not (equal? locked sigil-v)) (not (getenv "BUILD_REMOTE_ANY_SIGIL")))
+            (refused "REFUSED: sigil.lock pins sigil-stdlib ~a but this machine's sigil is ~a; the runner's native build would refuse the skew. Run with that version first on PATH (PATH=~/.sigil/versions/~a:$PATH), relock, or set BUILD_REMOTE_ANY_SIGIL=1"
+                     locked sigil-v locked)))
+        (when (and (pair? outputs) (file-exists? outdest))
+          (refused "REFUSED: build/remote-out-~a already exists; remove it to fetch this sha's outputs again" sha))
+        (when (and fetch (file-exists? dest))
+          (refused "REFUSED: build/remote-web-~a already exists; remove it to rebuild this sha" sha))
+        (say "HEAD ~a (~a), sigil ~a, app ~a, web: ~a (config ~a), tests: ~a"
+             sha full sigil-v app (if web 1 0) web-config (if (null? tests) "none" (string-join tests " ")))
+        (with-temp-dir stage
+          ($ git bundle create ,(path stage "src.bundle") HEAD cwd: ,root)
+          (write-text (path stage "tests") (lines-file tests))
+          (write-text (path stage "commands") (lines-file commands))
+          (write-text (path stage "outputs") (lines-file outputs))
+          ($ cp ,(path tasks-dir "runner" "build-web.sh") ,(path stage "remote.sh"))
+          (let* ((log (path stage "cycle.log"))
+                 (t0 (current-seconds*))
+                 (proc (spawn ,remote --label ,(str app " " sha) --timeout ,(or (getenv "BUILD_TIMEOUT") "5400") --detach
+                              --put ,(str (path stage "src.bundle") ":src.bundle")
+                              --put ,(str (path stage "remote.sh") ":remote.sh")
+                              --put ,(str (path stage "tests") ":tests")
+                              --put ,(str (path stage "commands") ":commands")
+                              --put ,(str (path stage "outputs") ":outputs")
+                              --get ,(str "out:" (path stage "fetched"))
+                              -- bash remote.sh ,full ,sigil-v ,(if web "1" "0") ,(if release "1" "0") ,app ,web-config
+                              cwd: ,root out: ,log err: 'merge))
+                 ;; stream the cycle's output as it arrives
+                 (rc (let loop ((shown 0))
+                       (let* ((text (read-text log missing: ""))
+                              (len (string-length text)))
+                         (when (> len shown) (display (substring text shown len)))
+                         (if (process-alive? proc)
+                             (begin (sleep 2) (loop len))
+                             (let ((code (process-wait proc))
+                                   (rest (read-text log missing: "")))
+                               (when (> (string-length rest) len) (display (substring rest len (string-length rest))))
+                               code))))))
+            (say "remote cycle rc=~a in ~as" rc (- (current-seconds*) t0))
+            (let ((fetched (path stage "fetched")))
+              (when (and fetch (file? (path fetched "web" "index.html")))
+                (let ((marker (read-text (path fetched "web.complete") missing: "" trim: #t)))
+                  (if (and (memv rc '(0 1)) (equal? marker full) (file? (path fetched "web" (str app ".wasm"))))
+                      (begin
+                        (ensure-directory (path root "build"))
+                        ($ mv ,(path fetched "web") ,dest)
+                        (write-text (path dest "BUILD-SHA") (str full "\n"))
+                        (say "fetched the web build of ~a to build/remote-web-~a (wasm sha256 ~a)" sha sha
+                             (file-sha16 (path dest (str app ".wasm")))))
+                      (say "NOT filing the fetched tree as a build of ~a: cycle rc=~a, completion marker '~a'" sha rc marker))))
+              (when (and (pair? outputs) (directory? (path fetched "outputs")))
+                (ensure-directory (path root "build"))
+                ($ mv ,(path fetched "outputs") ,outdest)
+                (write-text (path outdest "BUILD-SHA") (str full "\n"))
+                (say "fetched the outputs of ~a to build/remote-out-~a" sha sha))
+              (when (directory? fetched)
+                (let ((logs (path root "build" (str "remote-web-" sha ".logs"))))
+                  ($ rm -rf ,logs)
+                  (ensure-directory logs)
+                  (each l '("build.log" "release.log" "deps.log" "guix.log")
+                    (when (file? (path fetched l)) ($ cp ,(path fetched l) ,(path logs l))))
+                  ($ cp ,log ,(path logs "cycle.log"))
+                  (say "runner logs in build/remote-web-~a.logs" sha))))
+            rc))))))
+
+(define (current-seconds*) (exact (floor (current-second))))
+
+;; sigil-stdlib's version: in sigil.lock (read as data), or #f
+(define (locked-stdlib-version lock)
+  (and (file? lock)
+       (let ((form (call-with-input-file lock read)))
+         (and (pair? form) (eq? (car form) 'lock)
+              (let loop ((ps (cdr form)))
+                (cond ((null? ps) #f)
+                      ((and (pair? (car ps)) (member "sigil-stdlib" (car ps)))
+                       (let ((v (member 'version: (car ps)))) (and v (pair? (cdr v)) (cadr v))))
+                      (else (loop (cdr ps)))))))))
+(define (executable? f) (ok? ($? test -x ,f)))
+(define (list-head xs n) (if (or (null? xs) (= n 0)) '() (cons (car xs) (list-head (cdr xs) (- n 1)))))
+
+(exit (with-refusals main))

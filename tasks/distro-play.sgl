@@ -1,0 +1,90 @@
+;;; distro-play ubuntu|fedora|debian|arch ARCHIVE [BINARY] [ARGS...] - play a
+;;; game's Linux release archive inside a stock distribution's userland, on
+;;; this desktop's display, GPU and audio, to check a download works off the
+;;; machine that built it.
+;;;
+;;;   sgx substratic:distro-play ubuntu dist/game-v1-linux-amd64.tar.gz
+;;;   sgx substratic:distro-play fedora dist/game.tar.gz bin/game --windowed
+;;;
+;;; Plain `docker run` (distrobox needs `mount --make-rshared /` on Guix).
+;;; The image is the distribution plus the desktop libraries a typical
+;;; install already has (Mesa, Wayland, X11, ALSA with the PulseAudio
+;;; plugin), built once and cached as distro-play-<distro>. The archive is
+;;; unpacked to a fresh temp directory and mounted read-only; the game runs
+;;; as your uid with HOME=/tmp, so it cannot touch your home directory. With
+;;; no BINARY, the first executable file at the archive's top folder runs.
+;;; ARGS reach the game as they are. A person runs this: it opens a window
+;;; and plays sound. Exit: the game's status; 1 no executable; 2 bad
+;;; arguments.
+(import (sigil list))
+(requires (tools docker tar id stat))
+(define args (script-args))
+(define (usage) (eprintln "distro-play: usage: distro-play ubuntu|fedora|debian|arch ARCHIVE [BINARY] [ARGS...]") (exit 2))
+(when (< (length args) 2) (usage))
+(define distro (car args))
+(define archive (cadr args))
+(define bin-arg (if (> (length args) 2) (caddr args) #f))
+(define game-args (if (> (length args) 3) (list-tail args 3) '()))
+(define apt-libs "libgl1 libegl1 libgles2 libgl1-mesa-dri libwayland-client0 libwayland-egl1 libwayland-cursor0 libxkbcommon0 libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxinerama1 libxext6")
+(define images
+  (list (list "ubuntu" "docker.io/library/ubuntu:24.04"
+              (str "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " apt-libs " libasound2t64 libasound2-plugins libpulse0 && rm -rf /var/lib/apt/lists/*"))
+        (list "fedora" "registry.fedoraproject.org/fedora:41"
+              "dnf install -y mesa-libGL mesa-libEGL mesa-libGLES mesa-dri-drivers libwayland-client libwayland-egl libwayland-cursor libxkbcommon libX11 libX11-xcb libXcursor libXrandr libXi libXinerama libXext alsa-lib alsa-plugins-pulseaudio pulseaudio-libs && dnf clean all")
+        (list "debian" "docker.io/library/debian:12"
+              (str "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " apt-libs " libasound2 libasound2-plugins libpulse0 && rm -rf /var/lib/apt/lists/*"))
+        (list "arch" "docker.io/library/archlinux:latest"
+              "pacman -Syu --noconfirm mesa libglvnd wayland libxkbcommon libx11 libxcursor libxrandr libxi libxinerama libxext alsa-lib alsa-plugins libpulse && pacman -Scc --noconfirm")))
+(define spec (or (assoc distro images) (begin (eprintln "distro-play: unknown distro ~a (ubuntu, fedora, debian or arch)" distro) (exit 2))))
+(unless (file? archive) (eprintln "distro-play: ~a is not a file" archive) (exit 2))
+(when (and bin-arg (or (starts-with? bin-arg "/") (contains? bin-arg "..")))
+  (eprintln "distro-play: BINARY is a path inside the archive's top folder") (exit 2))
+
+(define image (str "distro-play-" distro))
+(unless (ok? ($? docker image inspect ,image))
+  (eprintln "distro-play: building ~a from ~a (once)" image (cadr spec))
+  ($ docker build -q -t ,image -
+     in: ,(str "FROM " (cadr spec) "\nRUN " (caddr spec)
+               "\nRUN printf \"pcm.!default pulse\\nctl.!default pulse\\n\" > /etc/asound.conf\n")))
+
+;; inside the temp scope, leave by raising: `exit' there would skip its cleanup
+;; and leak the unpacked archive (the adversarial review, 2026-09-29)
+(define (play)
+(with-temp-dir work
+  ($ tar -C ,work -xzf ,archive)
+  (let* ((tops (filter (lambda (n) (directory? (path work n))) (directory-list work)))
+         (top (if (pair? tops) (path work (car tops)) (begin (eprintln "distro-play: the archive has no top folder") (raise (cons (quote dp-leave) 1)))))
+         (bin (or bin-arg
+                  (let ((xs (filter (lambda (n) (and (file? (path top n)) (ok? ($? test -x ,(path top n)))))
+                                    (list-sort string<? (directory-list top)))))
+                    (and (pair? xs) (car xs))))))
+    (unless (and bin (file? (path top bin)) (ok? ($? test -x ,(path top bin))))
+      (eprintln "distro-play: no executable found in ~a (pass BINARY)" (basename top)) (raise (cons (quote dp-leave) 1)))
+    (eprintln "distro-play: ~a running ~a/~a" distro (basename top) bin)
+    (let* ((uid (out id -u)) (gid (out id -g))
+           (rt (or (getenv "XDG_RUNTIME_DIR") (str "/run/user/" uid)))
+           (wl (let ((w (getenv "WAYLAND_DISPLAY"))) (if (and w (not (equal? w ""))) w "wayland-0")))
+           ;; the GPU device's own group, so the game can open /dev/dri without the host's group names
+           (gpu-gid (let ((r ($? stat -c "%g" /dev/dri/renderD128)))
+                      (if (ok? r) (trim (stdout-of r)) (out stat -c "%g" /dev/dri/card0))))
+           (xauth (getenv "XAUTHORITY"))
+           (r ($? docker run --rm -i
+                  --user ,(str uid ":" gid) --group-add ,gpu-gid
+                  --device /dev/dri
+                  -e "HOME=/tmp" -e "XDG_RUNTIME_DIR=/tmp/xdg"
+                  -e ,(str "WAYLAND_DISPLAY=" (or (getenv "WAYLAND_DISPLAY") ""))
+                  -e ,(str "DISPLAY=" (or (getenv "DISPLAY") ""))
+                  -e "PULSE_SERVER=unix:/tmp/xdg/pulse/native"
+                  -v ,(str rt "/" wl ":/tmp/xdg/" wl)
+                  -v ,(str rt "/pulse/native:/tmp/xdg/pulse/native")
+                  -v "/tmp/.X11-unix:/tmp/.X11-unix:ro"
+                  ,@(if (and xauth (not (equal? xauth "")))
+                        (list "-e" "XAUTHORITY=/tmp/.Xauthority" "-v" (str xauth ":/tmp/.Xauthority:ro"))
+                        '())
+                  -v ,(str top ":/game:ro") -w /game
+                  ,image ,(str "/game/" bin) ,@game-args)))
+      (display (stdout-of r))
+      (unless (equal? "" (stderr-of r)) (eprintln "~a" (trim (stderr-of r))))
+      (or (exit-status r) 1)))))
+
+(exit (guard (e ((and (pair? e) (eq? (car e) 'dp-leave)) (cdr e))) (play)))

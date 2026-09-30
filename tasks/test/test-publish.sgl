@@ -1,0 +1,350 @@
+;;; test-publish - the gate for stage-web, check-site and publish-web, on a
+;;; throwaway game: no network, no token, nothing deployed.
+;;;
+;;;   sigil tasks/test/test-publish.sgl        (TASKS=<dir> runs another copy
+;;;                                            of tasks/, for sabotage runs)
+;;;
+;;; It builds a fake game in a temp dir (a git repo with package.sgl,
+;;; substratic.sgv, site/, a web build and a one-leg arm), stages it and
+;;; checks it with the real tasks, then runs publish-web against:
+;;;   - checks/../test/r2-s3-mock.cjs (R2's S3 API and /tokens/verify, on loopback)
+;;;   - a stub `wrangler` that records its argv, its HOME, and a copy of the
+;;;     directory it was asked to deploy, prints the token it was given (the
+;;;     planted leak: publish-web must redact it), and fails, so nothing goes
+;;;     past the first deploy
+;;;   - stub `pass`, `gpg` and `gpg-connect-agent` over a fake password store
+;;; Last line is VERDICT; exit 0 only if every check passed.
+(define tasks-dir (or (getenv "TASKS") (realpath (path (script-dir) ".."))))
+(define mock (path tasks-dir "test" "r2-s3-mock.cjs"))
+(define token "tok-test-publish-ZZ9")
+(define account "acct-test")
+(define n 0)
+(define failed 0)
+(define last-out "")
+(define (check name ok)
+  (set! n (+ n 1))
+  (if ok
+      (println "PASS ~a" name)
+      (begin (set! failed (+ failed 1))
+             (println "FAIL ~a" name)
+             (each l (let ((ls (split last-out "\n"))) (if (> (length ls) 8) (list-tail ls (- (length ls) 8)) ls))
+               (println "    | ~a" l)))))
+(define (setup-failed why) (println "SETUP-FAILED: ~a" why) (exit 2))
+
+(define work (make-temp-directory))
+(define game (path work "game"))
+(define bin (path work "bin"))
+(define store (path work "store"))
+(define empty-store (path work "empty-store"))
+(define capture (path work "capture"))
+(define mock-proc #f)
+(define port #f)
+(define (w rel text) (ensure-directory (dirname (path game rel))) (write-text (path game rel) text))
+(define (log-text f) (if (file? f) (read-text f) ""))
+
+(define (start-mock scope mode)
+  (when mock-proc
+    (when (process-alive? mock-proc) (process-kill! mock-proc))
+    (process-wait mock-proc))
+  (when (file-exists? (path work "mock.log")) (delete-file (path work "mock.log")))
+  (set! mock-proc (spawn node ,mock 0 ,token ,scope ,mode out: ,(path work "mock.log") err: 'merge))
+  (wait-until (contains? (log-text (path work "mock.log")) "listening")
+              timeout: 10 interval: 0.1 message: "the R2 mock did not start")
+  (set! port (car (split (cadr (split (log-text (path work "mock.log")) "listening ")) " ")))
+  (write-text (path work "wrangler.log") ""))
+
+;; run a task in the game; CREDS: 'env, 'none (no env, empty store), 'pass (no env, fake store)
+(define (task creds name . args)
+  (let* ((base (list (cons "PATH" (str bin ":" (getenv "PATH")))
+                     (cons "R2_API_BASE" (str "http://127.0.0.1:" port))
+                     (cons "R2_S3_ENDPOINT" (str "http://127.0.0.1:" port))
+                     (cons "STUB_DIR" work)
+                     (cons "CLOUDFLARE_API_TOKEN" (if (eq? creds 'env) token ""))
+                     (cons "CLOUDFLARE_ACCOUNT_ID" (if (eq? creds 'env) account ""))
+                     (cons "PASSWORD_STORE_DIR" (if (eq? creds 'pass) store empty-store))))
+         (r ($? sigil ,(path tasks-dir (str name ".sgl")) ,@args cwd: ,game env: ,base err: 'merge timeout: 600)))
+    (set! last-out (stdout-of r))
+    (exit-status r)))
+
+(define (s3-requests) (length (filter (lambda (l) (regex-match? "(GET|PUT|HEAD|DELETE) /.*" l)) (split (log-text (path work "mock.log")) "\n"))))
+(define (puts key) (length (filter (lambda (l) (starts-with? l (str "PUT /fakegame-wasm/" key " -> 200"))) (split (log-text (path work "mock.log")) "\n"))))
+(define (deployed?) (contains? (log-text (path work "wrangler.log")) "pages deploy"))
+(define (says? s) (contains? last-out s))
+(define (git . args) (out git ,@args cwd: ,game))
+
+;; set once the fake game is staged and checked
+(define manifest #f)
+(define key #f)
+(define verified-text #f)
+(define (restore-verified) (write-text (path game "build/site.verified") verified-text))
+
+;; a refusal-table row: refused with EXPECT in the output, before R2 and any deploy
+(define (refused name expect . args)
+  (start-mock "fakegame-wasm" "honest")
+  (let ((rc (apply task (cons 'env (cons "publish-web" args)))))
+    (check (str "refused: " name) (and (= rc 1) (says? expect) (= 0 (s3-requests)) (not (deployed?))))))
+
+;; run THUNK with the game's file REL holding TEXT, then put it back
+(define (with-file rel text thunk)
+  (let ((old (read-text (path game rel))))
+    (write-text (path game rel) text)
+    (thunk)
+    (write-text (path game rel) old)
+    (unless (equal? (read-text (path game rel)) old) (setup-failed (str "could not restore " rel)))))
+
+(dynamic-wind
+  (lambda () #f)
+  (lambda ()
+    ;; ---- the fake game
+    (ensure-directory bin)
+    (w "package.sgl" "(package name: \"fakegame\" version: \"0.0.1\" sigil: \"0.22.7\" description: \"a test game\" license: \"MIT\")\n")
+    (w "substratic.sgv" (str "(substratic schema: 1)\n"
+                             "(publish credentials: (pass \"cloudflare/fakegame-site\")\n"
+                             "  pages: (project: \"fakegame\" production-branch: \"master\" preview-branch: \"preview\"\n"
+                             "          domains: (\"fakegame.test\") zone: \"fakegame.test\" compatibility-date: \"2026-07-14\")\n"
+                             "  wasm: (bucket: \"fakegame-wasm\" binding: \"WASM\" route: \"w\")\n"
+                             "  apps: ((name: \"fakegame\" web: (dir: \"build/web\") mount: \"play\"))\n"
+                             "  indexing: noindex\n"
+                             "  site: (source: \"site\" files: (\"index.html\" \"404.html\" \"robots.txt\" \"_headers\"))\n"
+                             "  check: (arm: \"scripts/arm.mjs\"))\n"))
+    (w "site/index.html" "<!doctype html><title>fake</title><p>soon</p>\n")
+    (w "site/404.html" "<!doctype html><title>404</title>\n")
+    (w "site/robots.txt" "User-agent: *\nDisallow: /\n")
+    (w "site/_headers" "/*\n  X-Robots-Tag: noindex\n")
+    ;; the arm: loads the page's wasm the way the page names it
+    (w "scripts/arm.mjs" (str "const [B, D] = process.argv.slice(2);\n"
+                              "const page = await (await fetch(B + '/play/')).text();\n"
+                              "const m = page.match(/data-wasm=\"([^\"]+)\"/);\n"
+                              "const r = await fetch(B + m[1] + '.wasm');\n"
+                              "if (r.status === 200) console.log('  ok   arm: the page\\'s wasm is served'); else { console.log('  FAIL arm: ' + r.status); process.exit(1); }\n"))
+    (w "README" "a fake game\n")
+    (w ".gitignore" "build/\n")
+    (w "build/web/index.html" "<!doctype html><canvas data-wasm=\"fakegame\"></canvas>\n")
+    ($ sh -c "head -c 200000 /dev/urandom > build/web/fakegame.wasm" cwd: ,game)
+    (w "build/web/assets/a.txt" "an asset\n")
+    (w "build/web/sigil-wasm-bridges.js" "// bridges\n")
+    (unless (ok? ($? sigil deps install cwd: ,game)) (setup-failed "sigil deps install in the fake game"))
+    ($ git init -q cwd: ,game)
+    ($ git -c user.email=t@t -c user.name=t add -A cwd: ,game)
+    ($ git -c user.email=t@t -c user.name=t commit -qm fake cwd: ,game)
+
+    ;; ---- stubs
+    (write-text (path bin "wrangler")
+                (str "#!/bin/sh\n"
+                     "echo \"wrangler $*\" >> \"$STUB_DIR/wrangler.log\"\n"
+                     "echo \"home $HOME\" >> \"$STUB_DIR/wrangler.log\"\n"
+                     "n=$(ls \"$STUB_DIR/capture\" 2>/dev/null | wc -l)\n"
+                     "mkdir -p \"$STUB_DIR/capture/$n\" && cp -a . \"$STUB_DIR/capture/$n/\"\n"
+                     "echo \"stub wrangler: token=$CLOUDFLARE_API_TOKEN account=$CLOUDFLARE_ACCOUNT_ID\"\n"
+                     "echo 'stub wrangler: refusing to deploy' >&2\n"
+                     "exit 1\n"))
+    (write-text (path bin "pass")
+                (str "#!/bin/sh\n"
+                     "[ \"$1\" = show ] || exit 2\n"
+                     "case \"$(cat \"$STUB_DIR/pass-mode\")\" in\n"
+                     "  ok) printf '%s\\nsome note\\naccount: %s\\n' '" token "' '" account "' ;;\n"
+                     "  malformed) printf '%s\\n' '" token "' ;;\n"
+                     "  fail) echo 'gpg: decryption failed: No secret key' >&2; exit 2 ;;\n"
+                     "esac\n"))
+    (write-text (path bin "gpg")
+                (str "#!/bin/sh\n"
+                     "echo 'sec:u:255:22:AAAA:1:::::::scESC:::+:::ed25519:::0:'\n"
+                     "echo 'grp:::::::::GRIPSIGN:'\n"
+                     "echo 'ssb:u:255:18:BBBB:1::::::e:::+:::cv25519::'\n"
+                     "echo 'grp:::::::::GRIPENC:'\n"))
+    (write-text (path bin "gpg-connect-agent")
+                (str "#!/bin/sh\n"
+                     "echo \"S KEYINFO GRIPSIGN D - - - P - - -\"\n"
+                     "echo \"S KEYINFO GRIPENC D - - $(cat \"$STUB_DIR/agent-cached\") P - - -\"\n"
+                     "echo OK\n"))
+    ($ chmod +x ,(path bin "wrangler") ,(path bin "pass") ,(path bin "gpg") ,(path bin "gpg-connect-agent"))
+    (ensure-directory (path store "cloudflare"))
+    (write-text (path store ".gpg-id") "KEYID\n")
+    (write-text (path store "cloudflare" "fakegame-site.gpg") "")
+    (ensure-directory empty-store)
+    (write-text (path work "pass-mode") "ok")
+    (write-text (path work "agent-cached") "1")
+    (start-mock "fakegame-wasm" "honest")
+
+    ;; ---- stage and check with the real tasks
+    (check "stage-web: rc 0" (= 0 (task 'none "stage-web" "build/site")))
+    (check "stage-web: a restage of an existing DIR is refused" (and (= 1 (task 'none "stage-web" "build/site")) (says? "exists")))
+    (check "stage-web: a DIR outside build/ is refused" (and (= 1 (task 'none "stage-web" "elsewhere")) (says? "is not under")))
+    (check "check-site: GREEN" (and (= 0 (task 'none "check-site" "build/site")) (says? "GREEN")))
+    (check "  ...and the arm's leg ran" (says? "ok   arm: the page's wasm is served"))
+    (check "  ...and wrote build/site.verified" (file? (path game "build/site.verified")))
+    (unless (file? (path game "build/site.verified")) (setup-failed "stage-web and check-site did not produce a verified tree"))
+    (set! manifest (read-text (path game "build/site.manifest")))
+    (set! key (let ((m (regex-search "  (w/[0-9a-f]{16}/fakegame\\.wasm)" manifest))) (if m (match-group m 1) (setup-failed "no wasm key in the manifest"))))
+    (set! verified-text (read-text (path game "build/site.verified")))
+
+    ;; ---- usage
+    (check "no arguments: rc 2" (= 2 (task 'none "publish-web")))
+    (check "unknown flag: rc 2" (= 2 (task 'none "publish-web" "build/site" "--bogus")))
+    (check "no message without --dry-run: rc 2" (= 2 (task 'none "publish-web" "build/site")))
+    (check "too many arguments: rc 2" (= 2 (task 'none "publish-web" "build/site" "m" "extra")))
+
+    ;; ---- dry runs and R2
+    (start-mock "fakegame-wasm" "honest")
+    (check "dry run, no credentials: rc 0, says R2 not checked, no S3 request"
+           (and (= 0 (task 'none "publish-web" "build/site" "--dry-run")) (says? "R2 was not checked") (= 0 (s3-requests))))
+    (check "dry run, in scope, key absent: says absent"
+           (and (= 0 (task 'env "publish-web" "build/site" "--dry-run")) (says? "is absent (the token reads the bucket)")))
+    (check "  ...dry run wrote nothing and deployed nothing" (and (= 0 (puts key)) (not (deployed?))))
+    (start-mock "fakegame-wasm" "honest")
+    (check "publish, no credentials anywhere: refused before R2 and deploy"
+           (and (= 1 (task 'none "publish-web" "build/site" "a message" "--preview"))
+                (says? "no pass entry") (= 0 (s3-requests)) (not (deployed?))))
+    (check "publish, key absent: put once, read back identical"
+           (begin (task 'env "publish-web" "build/site" "a message" "--preview")
+                  (and (= 1 (puts key)) (says? (str "put " key)) (says? "read back, identical"))))
+    (check "  ...stored as application/wasm" (contains? (log-text (path work "mock.log")) (str "stored-type fakegame-wasm/" key " application/wasm")))
+    (check "  ...then the deploy ran, from a directory holding tree, functions and wrangler.json" (deployed?))
+    (let ((cap (path capture "0")))
+      (check "  ...the deployed tree is the staged tree without the wasm"
+             (and (file? (path cap "tree/index.html")) (not (file-exists? (path cap "tree/w")))
+                  (ok? ($? diff -r --exclude=w ,(path game "build/site") ,(path cap "tree")))))
+      (check "  ...its functions/ and wrangler.json are DIR.pages's, byte for byte"
+             (and (ok? ($? diff -r ,(path game "build/site.pages/functions") ,(path cap "functions")))
+                  (ok? ($? cmp ,(path game "build/site.pages/wrangler.json") ,(path cap "wrangler.json"))))))
+    (check "  ...wrangler got the project, the preview branch and HEAD"
+           (contains? (log-text (path work "wrangler.log"))
+                      (str "pages deploy tree --project-name fakegame --branch preview --commit-hash " (git "rev-parse" "HEAD"))))
+    (check "  ...wrangler ran with a scratch HOME, not the user's"
+           (let ((m (regex-search "home (\\S+)" (log-text (path work "wrangler.log")))))
+             (and m (not (equal? (match-group m 1) (getenv "HOME"))))))
+    (check "  ...the stub's echo of the token was redacted" (and (says? "token=<token>") (not (says? token))))
+    (check "  ...and the failed deploy is reported" (says? "wrangler pages deploy to preview failed"))
+    (task 'env "publish-web" "build/site" "a message" "--preview")
+    (check "publish again: already there, no second put, deploy ran"
+           (and (says? "is already in fakegame-wasm") (= 1 (puts key)) (deployed?)))
+    (check "dry run, key present: says already there"
+           (and (= 0 (task 'env "publish-web" "build/site" "--dry-run")) (says? "is already there (the token reads the bucket)")))
+    (start-mock "some-other-bucket" "honest")
+    (check "dry run, token out of scope: rc 1, REFUSED"
+           (and (= 1 (task 'env "publish-web" "build/site" "--dry-run")) (says? "the token cannot read fakegame-wasm")))
+    (check "publish, token out of scope: refused, no put, no deploy, says 403"
+           (and (= 1 (task 'env "publish-web" "build/site" "a message" "--preview"))
+                (says? "could not read fakegame-wasm") (says? "HTTP 403")
+                (not (contains? (log-text (path work "mock.log")) "PUT")) (not (deployed?))))
+    (start-mock "fakegame-wasm" "honest")
+    ($ sh -c "head -c 1000 /dev/urandom > other.bin" cwd: ,work)
+    ($ sigil ,(path tasks-dir "r2-s3.sgl") put fakegame-wasm ,key ,(path work "other.bin") application/wasm cwd: "/tmp"
+       env: ,(list (cons "CLOUDFLARE_API_TOKEN" token) (cons "CLOUDFLARE_ACCOUNT_ID" account)
+                   (cons "R2_API_BASE" (str "http://127.0.0.1:" port)) (cons "R2_S3_ENDPOINT" (str "http://127.0.0.1:" port))))
+    (check "publish, the key holds OTHER bytes: refused, not overwritten, no deploy"
+           (and (= 1 (task 'env "publish-web" "build/site" "a message" "--preview"))
+                (says? "is not the verified wasm") (= 1 (puts key)) (not (deployed?))))
+    (check "  ...nothing was ever deleted" (not (contains? (log-text (path work "mock.log")) "DELETE")))
+    (start-mock "fakegame-wasm" "corruptget")
+    (check "publish, the read-back differs from what was put: refused, no deploy"
+           (and (= 1 (task 'env "publish-web" "build/site" "a message" "--preview"))
+                (= 1 (puts key)) (says? "is not the verified wasm") (not (deployed?))))
+
+    ;; ---- credentials from pass
+    (start-mock "fakegame-wasm" "honest")
+    (check "pass: the token from the store reaches R2 and wrangler"
+           (begin (task 'pass "publish-web" "build/site" "a message" "--preview")
+                  (and (= 1 (puts key)) (deployed?) (says? "token=<token>") (not (says? token)))))
+    (write-text (path work "agent-cached") "-")
+    (start-mock "fakegame-wasm" "honest")
+    (check "pass: the agent has not unlocked the key: exit 77, pass never run, nothing sent"
+           (and (= 77 (task 'pass "publish-web" "build/site" "a message" "--preview"))
+                (says? "has not unlocked the key") (= 0 (s3-requests))))
+    (write-text (path work "agent-cached") "1")
+    (write-text (path work "pass-mode") "malformed")
+    (check "pass: a malformed entry is refused, not half-used"
+           (and (= 1 (task 'pass "publish-web" "build/site" "a message" "--preview")) (says? "is malformed") (= 0 (s3-requests))))
+    (write-text (path work "pass-mode") "fail")
+    (check "pass: pass failing after the agent check is 'locked or failed', never 'absent'"
+           (and (= 1 (task 'pass "publish-web" "build/site" "a message" "--preview"))
+                (says? "locked or gpg failed") (not (says? "no pass entry"))))
+    (write-text (path work "pass-mode") "ok")
+    (check "env: a token without an account is refused"
+           (let ((r ($? sigil ,(path tasks-dir "publish-web.sgl") build/site m --preview cwd: ,game err: 'merge
+                        env: ,(list (cons "CLOUDFLARE_API_TOKEN" token) (cons "CLOUDFLARE_ACCOUNT_ID" "")
+                                    (cons "PASSWORD_STORE_DIR" empty-store)))))
+             (set! last-out (stdout-of r))
+             (and (= 1 (exit-status r)) (says? "CLOUDFLARE_ACCOUNT_ID is not"))))
+
+    ;; ---- the refusal table: each refused before R2 and before any deploy
+    (with-file "build/site/index.html" "changed after the check\n"
+      (lambda () (refused "a tree file changed after the check" "no longer matches" "build/site" "m" "--preview")))
+    (with-file "build/site.pages/functions/w/[[path]].js" "export const x = 1;\n"
+      (lambda () (refused "the generated Function changed after the check" "no longer matches" "build/site" "m" "--preview")))
+    (with-file "build/site.pages/wrangler.json" "{}\n"
+      (lambda () (refused "wrangler.json changed after the check" "no longer matches" "build/site" "m" "--preview")))
+    (let ((v (path game "build/site.verified")))
+      (delete-file v)
+      (refused "no DIR.verified" "missing (stage-web, then check-site, first)" "build/site" "m" "--preview")
+      (write-text v (regex-replace "manifest-sha256 [0-9a-f]+" verified-text "manifest-sha256 0000"))
+      (refused "DIR.verified for another manifest" "is not for this manifest" "build/site" "m" "--preview")
+      (write-text v (regex-replace "(?m)^tools .*$" verified-text "tools substratic 0.0.0 0000"))
+      (refused "DIR.verified written by other tools" "not these tools" "build/site" "m" "--preview")
+      (write-text v (regex-replace "(?m)^gate [0-9a-f]+ (\\S*arm\\.mjs)$" verified-text "gate 0000000000000000000000000000000000000000000000000000000000000000 $1"))
+      (refused "a gate file that no longer hashes as it did" "is not the file that checked" "build/site" "m" "--preview")
+      (write-text v (regex-replace "(?m)^gate \\S+ \\S*serve-site\\.mjs\\n" verified-text ""))
+      (refused "DIR.verified missing one of the gate files" "other gate files than check-site uses now" "build/site" "m" "--preview")
+      (write-text v (regex-replace "gate-clean yes" verified-text "gate-clean no"))
+      (refused "checked from a dirty checkout" "checked from a checkout with tracked changes" "build/site" "m" "--preview")
+      (restore-verified))
+    (with-file "README" "dirty\n"
+      (lambda () (refused "tracked changes in the working tree" "the working tree has tracked changes" "build/site" "m" "--preview")))
+    ($ git -c user.email=t@t -c user.name=t commit -q --allow-empty -m moved cwd: ,game)
+    (refused "HEAD moved since the check" "was checked at another commit" "build/site" "m" "--preview")
+    ($ git reset -q --hard "HEAD~1" cwd: ,game)
+    (ensure-directory (path work "tmp-with-config"))
+    (write-text (path work "tmp-with-config" "wrangler.toml") "name = \"x\"\n")
+    (start-mock "fakegame-wasm" "honest")
+    (let ((r ($? sigil ,(path tasks-dir "publish-web.sgl") build/site m --preview cwd: ,game err: 'merge
+                 env: ,(list (cons "PATH" (str bin ":" (getenv "PATH"))) (cons "STUB_DIR" work)
+                             (cons "TMPDIR" (path work "tmp-with-config"))
+                             (cons "CLOUDFLARE_API_TOKEN" token) (cons "CLOUDFLARE_ACCOUNT_ID" account)
+                             (cons "R2_API_BASE" (str "http://127.0.0.1:" port)) (cons "R2_S3_ENDPOINT" (str "http://127.0.0.1:" port))))))
+      (set! last-out (stdout-of r))
+      (check "refused: a wrangler config above the deploy directory"
+             (and (= 1 (exit-status r)) (says? "holds a wrangler config") (= 0 (s3-requests)) (not (deployed?)))))
+    (check "  (positive control: the same run without it goes on to R2 and the deploy)"
+           (begin (start-mock "fakegame-wasm" "honest")
+                  (task 'env "publish-web" "build/site" "a message" "--preview")
+                  (and (> (s3-requests) 0) (deployed?))))
+
+    ;; ---- check-site's own refusals (each: RED or SETUP-FAILED, and no .verified)
+    (define (restage)
+      (each s '("" ".manifest" ".verified" ".pages") ($ rm -rf ,(path game (str "build/site" s))))
+      (unless (= 0 (task 'none "stage-web" "build/site")) (setup-failed (str "restage: " last-out))))
+    (define (no-verified?) (not (file-exists? (path game "build/site.verified"))))
+    (with-file "build/site/index.html" "changed after staging\n"
+      (lambda ()
+        (check "check-site: a tree changed after staging is RED, no .verified"
+               (and (= 1 (task 'none "check-site" "build/site")) (says? "FAIL manifest") (no-verified?)))))
+    (with-file "site/_headers" "/*\n  X-Content-Type-Options: nosniff\n"
+      (lambda ()
+        (restage)
+        (check "check-site: a site without X-Robots-Tag: noindex is RED, no .verified"
+               (and (= 1 (task 'none "check-site" "build/site")) (says? "FAIL noindex") (no-verified?)))))
+    (restage)
+    (with-file "scripts/arm.mjs" "console.log('  FAIL arm: planted');\nprocess.exit(1);\n"
+      (lambda ()
+        (check "check-site: a red arm is RED, no .verified"
+               (and (= 1 (task 'none "check-site" "build/site")) (says? "FAIL arm: planted") (no-verified?)))))
+    (with-file "scripts/arm.mjs" "console.log('  ok   arm: fine');\nprocess.exit(3);\n"
+      (lambda ()
+        (check "check-site: an arm that crashes (exit 3) is SETUP-FAILED (2), not a verdict, no .verified"
+               (and (= 2 (task 'none "check-site" "build/site")) (says? "SETUP-FAILED") (no-verified?)))))
+    (with-file "scripts/arm.mjs" "console.log('  ok   arm: never loaded the page');\n"
+      (lambda ()
+        (check "check-site: an arm that never loads the wasm fails the fetched leg"
+               (and (= 1 (task 'none "check-site" "build/site")) (says? "FAIL fetched") (no-verified?)))))
+    (check "check-site: back to GREEN after all of that (positive control)"
+           (and (= 0 (task 'none "check-site" "build/site")) (not (no-verified?)))))
+  (lambda ()
+    (when mock-proc
+      (when (process-alive? mock-proc) (process-kill! mock-proc))
+      (process-wait mock-proc))
+    (if (= failed 0)
+        ($ rm -rf ,work)
+        (eprintln "test-publish: evidence in ~a" work))))
+
+(println "VERDICT: ~a/~a passed" (- n failed) n)
+(exit (if (= failed 0) 0 1))

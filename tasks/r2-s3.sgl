@@ -1,0 +1,54 @@
+;;; r2-s3 - read and write single R2 objects through R2's S3-compatible API
+;;; ((substratic tasks r2)), the games' scripts/r2-s3 as a task.
+;;;
+;;;   sgx substratic:r2-s3 head BUCKET KEY                  is it there?
+;;;   sgx substratic:r2-s3 get  BUCKET KEY FILE             FILE written only on success
+;;;   sgx substratic:r2-s3 put  BUCKET KEY FILE TYPE [CC]   upload with Content-Type TYPE
+;;;                                                         (and Cache-Control CC)
+;;;
+;;; Exit status: 0 done / present; 3 the key is absent (404 NoSuchKey, head
+;;; and get only); 1 anything else, a missing bucket included, with the HTTP
+;;; status and R2's error code on stderr; 2 bad arguments. Never deletes.
+;;;
+;;; The credential: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID, else the
+;;; pass entry substratic.sgv names (run inside the game's checkout).
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks config) (substratic tasks credentials)
+        (substratic tasks r2))
+(requires (tools curl cp chmod))
+(set-task-name! "r2-s3")
+
+(define (usage)
+  (usage-error "usage: r2-s3 head BUCKET KEY | get BUCKET KEY FILE | put BUCKET KEY FILE TYPE [CACHE-CONTROL]"))
+(define args (script-args))
+(when (< (length args) 3) (usage))
+(define op (car args))
+(define n (length args))
+(cond ((equal? op "head") (unless (= n 3) (usage)))
+      ((equal? op "get") (unless (= n 4) (usage)))
+      ((equal? op "put") (unless (or (= n 5) (= n 6)) (usage)))
+      (else (usage)))
+
+;; the environment's values are checked here, before anything else, and a
+;; bad one is a usage error (2) as in the sh helper
+(let ((t (getenv "CLOUDFLARE_API_TOKEN")) (a (getenv "CLOUDFLARE_ACCOUNT_ID")))
+  (when (and t (not (equal? t "")) (not (and (one-line? t) (regex-match? "[A-Za-z0-9_-]+" t))))
+    (usage-error "CLOUDFLARE_API_TOKEN is not a Cloudflare token (characters outside [A-Za-z0-9_-])"))
+  (when (and a (not (equal? a "")) (not (and (one-line? a) (regex-match? "[A-Za-z0-9_-]+" a))))
+    (usage-error "CLOUDFLARE_ACCOUNT_ID has characters outside [A-Za-z0-9_-]")))
+
+(define (run)
+  (guard (e ((and (pair? e) (eq? (car e) 'r2-usage)) (usage-error "~a" (cdr e))))
+    (let ((bucket (cadr args)) (key (caddr args)))
+      (r2-check-names bucket key)
+      (when (equal? op "put")
+        (unless (file? (list-ref args 3)) (refuse "~a is not a file" (list-ref args 3))))
+      (let ((cred (let ((t (getenv "CLOUDFLARE_API_TOKEN")))
+                    (if (and t (not (equal? t "")))
+                        (resolve-credentials '())
+                        (resolve-credentials (read-config (project-dir)))))))
+        (cond ((equal? op "head") (r2-head cred bucket key))
+              ((equal? op "get") (r2-get cred bucket key (list-ref args 3)))
+              (else (apply r2-put cred bucket key (list-tail args 3))))))))
+
+(exit (with-refusals run))

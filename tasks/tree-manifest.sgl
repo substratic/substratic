@@ -1,0 +1,23 @@
+;;; tree-manifest DIR [ROOT] - print the identity of a deploy.
+;;;
+;;; One "sha256  path" line per file under DIR, then "sha256  @path" for
+;;; ROOT's functions/ and wrangler config (ROOT defaults to DIR.pages, where
+;;; stage-web generates them). The same bytes as the games' sh
+;;; scripts/tree-manifest for the same input. Exit 0 with the lines; 1 and
+;;; nothing on stdout when it refuses (see (substratic tasks manifest));
+;;; 2 for bad arguments.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (substratic tasks common) (substratic tasks manifest))
+(set-task-name! "tree-manifest")
+
+(define args (script-args))
+(when (or (null? args) (> (length args) 2) (equal? (car args) ""))
+  (usage-error "give the staged directory: tree-manifest DIR [ROOT]"))
+(define dir (let ((d (car args))) (if (and (> (string-length d) 1) (ends-with? d "/")) (substring d 0 (- (string-length d) 1)) d)))
+(define root (if (= (length args) 2) (cadr args) (str dir ".pages")))
+(unless (directory? dir) (usage-error "give the staged directory (~a is not one)" dir))
+
+(with-refusals
+  (lambda ()
+    (let ((lines (tree-manifest dir root)))
+      (for-each (lambda (l) (display l) (newline)) lines))))

@@ -1,0 +1,21 @@
+;;; verify-live URL DIR [--wrangler-dev] - check a deployment against the
+;;; staged tree it was published from (checks/verify-live.mjs; its header
+;;; says what each leg checks). publish-web runs it on every deployment;
+;;; run it by hand after cloudflare-setup --domain, on the custom domain.
+;;;
+;;;   sgx substratic:verify-live https://<id>.<project>.pages.dev build/site
+;;;   sgx substratic:verify-live https://example.com build/site
+;;;
+;;; Exit 0 green, 1 red, 2 setup failed (verify-live.mjs's own codes).
+(requires (tools node))
+(define args (script-args))
+(unless (and (>= (length args) 2) (<= (length args) 3)
+             (or (= (length args) 2) (equal? (list-ref args 2) "--wrangler-dev")))
+  (eprintln "verify-live: usage: verify-live URL DIR [--wrangler-dev]")
+  (exit 2))
+(define r ($? node ,(path (realpath (script-dir)) "checks" "verify-live.mjs") ,@args timeout: 900))
+(display (stdout-of r))
+(unless (equal? "" (stderr-of r)) (eprintln "~a" (trim (stderr-of r))))
+(exit (cond ((timed-out? r) (eprintln "verify-live: TIMED-OUT after 900 s") 2)
+            ((exit-status r) (exit-status r))
+            (else 2)))

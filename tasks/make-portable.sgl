@@ -1,0 +1,41 @@
+;;; make-portable IN OUT - a copy of a Linux executable that starts on
+;;; ordinary distributions: its ELF interpreter set to the standard
+;;; /lib64/ld-linux-x86-64.so.2 (patchelf), then check-linux-binary run on it.
+;;; The step the games' release-archive scripts do on
+;;; the packed copy (never on the build's own executable).
+;;;
+;;;   sgx substratic:make-portable build/release/bin/game dist/game-v1/bin/game
+;;;
+;;; OUT is written only here and removed again if it is not portable.
+;;; Refuses: OUT the same file as IN; patchelf leaving the file unchanged
+;;; (IN was already patched, or patchelf did nothing); a result
+;;; check-linux-binary fails (a /gnu/store RUNPATH or library, a library
+;;; outside glibc, a glibc floor past GLIBC_MAX). Prints the check's lines,
+;;; including "glibc-floor X.Y" for the README. patchelf comes from PATH,
+;;; else from `guix shell patchelf`. Exit 0 portable, 1 refused, 125 setup.
+(requires (tools cp cmp chmod))
+(define args (script-args))
+(define (refused fmt . xs) (eprintln "make-portable: REFUSED: ~a" (apply format (cons fmt xs))) (exit 1))
+(unless (= (length args) 2) (eprintln "make-portable: usage: make-portable IN OUT") (exit 125))
+(define in (car args))
+(define outf (cadr args))
+(unless (file? in) (eprintln "make-portable: ~a is not a file" in) (exit 125))
+(when (and (file-exists? outf) (equal? (realpath outf) (realpath in)))
+  (refused "OUT is IN; patch a copy, never the build's own executable"))
+(ensure-directory (dirname (if (starts-with? outf "/") outf (path (current-directory) outf))))
+($ cp ,in ,outf)
+($ chmod u+w ,outf)
+(define patchelf (if (ok? ($? sh -c "command -v patchelf")) '("patchelf") '("guix" "shell" "patchelf" "--" "patchelf")))
+(let ((p ($? ,@patchelf --set-interpreter "/lib64/ld-linux-x86-64.so.2" ,outf timeout: 300)))
+  (unless (ok? p) (delete-file outf) (refused "patchelf failed: ~a" (trim (stderr-of p)))))
+(when (ok? ($? cmp -s ,in ,outf))
+  (delete-file outf)
+  (refused "patchelf left the executable unchanged (was ~a already patched?)" in))
+(define check ($? sigil ,(path (realpath (script-dir)) "check-linux-binary.sgl") ,outf))
+(display (stdout-of check))
+(unless (ok? check)
+  (delete-file outf)
+  (if (equal? (exit-status check) 1)
+      (refused "~a is not portable (above); nothing written" in)
+      (begin (eprintln "~a" (trim (stderr-of check))) (exit 125))))
+(eprintln "make-portable: ~a -> ~a (portable)" in outf)

@@ -1,0 +1,4 @@
+#!/bin/sh
+# test/r2-s3-sigil: the Sigil r2-s3 task behind the sh helper's command line,
+# so the games' sh gates (test-r2-s3) can run against it.
+exec sigil "$(dirname "$0")/../r2-s3.sgl" "$@"

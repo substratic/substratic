@@ -1,0 +1,292 @@
+;;; publish-web DIR "<one line>" [--preview | --dry-run] - publish exactly
+;;; the tree check-site checked, or nothing.
+;;;
+;;;   sgx substratic:publish-web DIR "<one line>" --preview   the preview branch only
+;;;   sgx substratic:publish-web DIR "<one line>"             preview, checked live,
+;;;                                                          then production
+;;;   sgx substratic:publish-web DIR --dry-run               every check, nothing leaves
+;;;
+;;; The path: build-remote; stage-web DIR (with the game's web: env: pointing
+;;; at the runner build); check-site DIR; then this. Ported from the games'
+;;; sh scripts. It refuses unless, NOW:
+;;;
+;;;   - DIR with DIR.pages still hashes to DIR.manifest;
+;;;   - DIR.verified names that manifest's sha256, and was written by these
+;;;     same tools: its `tools` line is this substratic's identity, and its
+;;;     gate files are exactly the ones check-site would hash now, each
+;;;     still hashing to what it did when the check started;
+;;;   - the check ran at HEAD on a clean checkout; the tree was staged at
+;;;     HEAD; the working tree has no tracked changes.
+;;;
+;;; Then DIR and DIR.pages are COPIED into a deploy directory this task owns
+;;; (an empty temp dir with no wrangler config anywhere above it: wrangler 4
+;;; reads and edits the config it finds in its cwd) and checked again. The
+;;; wasm comes out of the copy and goes to R2 through its S3 API ((substratic
+;;; tasks r2)): read first; put only when the key is absent (never when the
+;;; read failed any other way); read back and compared byte for byte. Nothing
+;;; is ever deleted or overwritten. Then `wrangler pages deploy` runs from the
+;;; deploy directory, with the credential in its environment and its HOME and
+;;; XDG_CONFIG_HOME pointed at an empty directory (so a `wrangler login` on
+;;; this machine is never used), its output captured and shown redacted.
+;;; Before each deploy the deploy directory is re-hashed. Without --preview
+;;; the same copy goes to the preview branch first; checks/verify-live.mjs
+;;; checks its URL; production is deployed only if that is green, and then
+;;; checked the same way.
+;;;
+;;; Credentials: the environment, else the pass entry substratic.sgv names
+;;; ((substratic tasks credentials)). --dry-run reads no pass entry: with
+;;; CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID set it makes ONE read-only
+;;; request, a read of the wasm's key, to show the token reaches the bucket
+;;; (present or absent, either is fine; a refusal fails the dry run). Never
+;;; touches DNS or the project's settings.
+(load (path (script-dir) "substratic" "load.sgl"))
+(import (sigil list) (substratic tasks common) (substratic tasks config) (substratic tasks manifest)
+        (substratic tasks credentials) (substratic tasks r2))
+(requires (tools git node cp cmp du))
+(set-task-name! "publish-web")
+
+(define tasks-dir (realpath (script-dir)))
+(define pages-cap 26214400)
+
+;; the gate files check-site hashes (tasks/check-site.sgl, shared-gates)
+(define shared-gates
+  (list "check-site.sgl" "checks/check-site.mjs" "checks/serve-site.mjs"
+        "substratic/load.sgl" "substratic/tasks/common.sgl" "substratic/tasks/config.sgl"
+        "substratic/tasks/manifest.sgl"))
+
+;; ---- arguments
+(define dir-arg #f)
+(define message #f)
+(define dry #f)
+(define only-preview #f)
+(each a (script-args)
+  (cond ((equal? a "--dry-run") (set! dry #t))
+        ((equal? a "--preview") (set! only-preview #t))
+        ((starts-with? a "-") (usage-error "unknown flag ~a" a))
+        ((not dir-arg) (set! dir-arg a))
+        ((not message) (set! message a))
+        (else (usage-error "too many arguments"))))
+(unless dir-arg (usage-error "give the staged directory"))
+(unless (or message dry) (usage-error "give the deploy a one-line message"))
+(when (and message (not (one-line? message))) (usage-error "the message must be one line"))
+
+(define (strip-slash d)
+  (if (and (> (string-length d) 1) (ends-with? d "/")) (substring d 0 (- (string-length d) 1)) d))
+
+(define (lines-of text) (filter (lambda (l) (not (equal? l ""))) (split text "\n")))
+
+(define (verified-lines file key)
+  (filter-map (lambda (l)
+                (and (starts-with? l (str key " ")) (substring l (+ 1 (string-length key)) (string-length l))))
+              (lines-of (read-text file))))
+
+(define (filter-map f xs)
+  (if (null? xs) '() (let ((v (f (car xs)))) (if v (cons v (filter-map f (cdr xs))) (filter-map f (cdr xs))))))
+
+(define (publish)
+  (let* ((root (project-dir))
+         (config (read-config root))
+         (app (publish-app config))
+         (name (cdr (assoc "name" app)))
+         (route (cfg config "publish" "wasm" "route"))
+         (bucket (cfg config "publish" "wasm" "bucket"))
+         (project (cfg config "publish" "pages" "project"))
+         (dir (let ((d (strip-slash dir-arg))) (if (starts-with? d "/") d (path (current-directory) d))))
+         (pages (str dir ".pages"))
+         (manifest (str dir ".manifest"))
+         (verified (str dir ".verified")))
+    (each f (list (path dir "index.html") manifest verified)
+      (unless (file? f) (refuse "~a missing (stage-web, then check-site, first)" f)))
+    (let ((want (manifest-body manifest)))
+      (define (same d label proot)
+        (let ((got (guard (e ((refusal? e) (refuse "tree-manifest refused ~a: ~a" label (refusal-message e))))
+                     (string-join (tree-manifest d proot) "\n"))))
+          (unless (equal? got want) (refuse "~a no longer matches ~a.manifest; restage and recheck" label dir-arg))))
+      (same dir dir-arg pages)
+      (let ((msha (file-sha256 manifest)))
+        (unless (equal? (verified-lines verified "manifest-sha256") (list msha))
+          (refuse "~a.verified is not for this manifest; rerun check-site" dir-arg))
+        ;; the tools that checked it are the tools running now
+        (let ((tools (tools-identity tasks-dir)))
+          (unless (equal? (verified-lines verified "tools") (list tools))
+            (refuse "~a.verified was written by ~a, not these tools (~a); rerun check-site"
+                    dir-arg (let ((t (verified-lines verified "tools"))) (if (pair? t) (car t) "no tools line")) tools)))
+        (let* ((expected (map realpath
+                              (append (map (lambda (g) (path tasks-dir g)) shared-gates)
+                                      (list (path root (cfg config "publish" "check" "arm")))
+                                      (map (lambda (g) (path root g)) (cfg config "publish" "check" "gate-files")))))
+               (gates (map (lambda (l)
+                             ;; "<sha256> <path>": the path is the rest of the line (it may hold spaces)
+                             (let ((m (regex-match "([0-9a-f]{64}) (/.+)" l)))
+                               (unless m (refuse "~a.verified has a malformed gate line: ~a" dir-arg l))
+                               (cons (match-group m 1) (match-group m 2))))
+                           (verified-lines verified "gate"))))
+          (unless (>= (length gates) 3) (refuse "~a.verified names ~a gate files, not 3 or more" dir-arg (length gates)))
+          (each g gates
+            (unless (and (file? (cdr g)) (equal? (file-sha256 (cdr g)) (car g)))
+              (refuse "~a is not the file that checked ~a; rerun check-site" (cdr g) dir-arg)))
+          (unless (equal? (list-sort string<? (map cdr gates)) (list-sort string<? expected))
+            (refuse "~a.verified names other gate files than check-site uses now; rerun check-site" dir-arg)))
+        (let ((head (out git rev-parse HEAD cwd: ,root)))
+          (unless (equal? (verified-lines verified "gate-head") (list head))
+            (refuse "~a was checked at another commit; rerun check-site at HEAD" dir-arg))
+          (unless (equal? (verified-lines verified "gate-clean") (list "yes"))
+            (refuse "~a was checked from a checkout with tracked changes" dir-arg))
+          (unless (equal? (manifest-header-ref manifest "head") head)
+            (refuse "~a was staged at another commit; restage and recheck" dir-arg))
+          ;; the copied files were HEAD's (the adversarial review, 2026-09-29: a
+          ;; tree staged from an edit, then reverted, checked green at HEAD)
+          (unless (equal? (manifest-header-ref manifest "clean") "yes")
+            (refuse "~a was staged from a checkout with tracked changes; restage from a clean one" dir-arg))
+          ;; a runner build is of one commit: it must be this one (a local build carries no stamp and is named as such)
+          (let* ((built (or (manifest-header-ref manifest "built") ""))
+                 (m (regex-match "([0-9a-f]{40}) \\(runner build\\)" built)))
+            (when (and m (not (equal? (match-group m 1) head)))
+              (refuse "the game in ~a was built at ~a; HEAD is ~a (build-remote, then restage)" dir-arg
+                      (substring (match-group m 1) 0 12) (substring head 0 12))))
+          (unless (equal? "" (out git status --porcelain "--untracked-files=no" cwd: ,root))
+            (refuse "the working tree has tracked changes"))
+          (say "~a matches its manifest (~a), checked at HEAD ~a on a clean checkout by ~a; game ~a"
+               dir-arg (substring msha 0 16) (substring head 0 12) (tools-identity tasks-dir)
+               (or (manifest-header-ref manifest "built") "?"))
+          (with-temp-dir work
+            (let* ((d (path work "deploy"))
+                   (tree (path d "tree"))
+                   (home (path work "home")))
+              (ensure-directory tree)
+              (ensure-directory home)
+              ($ cp -a ,(str dir "/.") ,(str tree "/"))
+              ($ cp -a ,(path pages "functions") ,(path d "functions"))
+              ($ cp ,(path pages "wrangler.json") ,(path d "wrangler.json"))
+              (same tree "the deploy directory's copy" d)
+              (let ((wj-sha (file-sha256 (path d "wrangler.json"))))
+                ;; no wrangler config or deploy redirect anywhere above the deploy directory
+                (let walk ((p work))
+                  (each f '("wrangler.json" "wrangler.jsonc" "wrangler.toml" ".wrangler/deploy/config.json")
+                    (when (file-exists? (path p f)) (refuse "~a holds a wrangler config or deploy redirect" p)))
+                  (unless (equal? p "/") (walk (dirname p))))
+                (when (file-exists? (path d ".wrangler"))
+                  (refuse "a .wrangler directory appeared in the deploy directory"))
+                ;; the wasm: out of the copy, to R2 below
+                (let* ((wasms (filter (lambda (e) (ends-with? (cdr e) ".wasm")) (manifest-entries manifest)))
+                       (key (if (= (length wasms) 1)
+                                (cdar wasms)
+                                (refuse "want exactly one wasm in the tree, found: ~a" (string-join (map cdr wasms) " "))))
+                       (m (regex-match (str (regex-quote route) "/([0-9a-f]{16})/" (regex-quote name) "\\.wasm") key))
+                       (sha16 (if m (match-group m 1)
+                                  (refuse "the wasm is at ~a, not ~a/<sha16>/~a.wasm" key route name)))
+                       (wasm-file (path work (str name ".wasm")))
+                       (back (path work "back.wasm")))
+                  ($ cp ,(path tree key) ,wasm-file)
+                  (unless (equal? (file-sha16 wasm-file) sha16) (refuse "~a does not hash to its name" key))
+                  ;; the route holds the wasm and nothing else, so removing it
+                  ;; from the copy removes nothing that should deploy
+                  (let ((rest (filter (lambda (e) (and (starts-with? (cdr e) (str route "/")) (not (equal? (cdr e) key))))
+                                      (manifest-entries manifest))))
+                    (unless (null? rest)
+                      (refuse "~a/ holds more than the wasm: ~a" route (string-join (map cdr rest) " "))))
+                  ($ rm -rf ,(path tree route))
+                  (let ((big (filter (lambda (f) (> (file-size f) pages-cap))
+                                     (map (lambda (e) (path tree (cdr e)))
+                                          (filter (lambda (e) (and (not (starts-with? (cdr e) "@")) (not (equal? (cdr e) key))))
+                                                  (manifest-entries manifest))))))
+                    (unless (null? big) (refuse "over Pages' 25 MiB cap: ~a" (string-join big " "))))
+                  (let* ((want-nowasm (string-join (filter (lambda (l) (not (ends-with? l (str "  " key))))
+                                                           (split want "\n"))
+                                                   "\n"))
+                         (nfiles (length (filter (lambda (e) (not (starts-with? (cdr e) "@"))) (manifest-entries manifest))))
+                         (wasm-bytes (file-size wasm-file)))
+                    (if dry
+                        (dry-run config bucket key wasm-bytes (- nfiles 1) (out du -sh ,tree) project d)
+                        (live config root dir dir-arg manifest head bucket key wasm-file back d home
+                              project want-nowasm wj-sha))))))))))))
+
+(define (regex-quote s) (regex-replace-all "[\\\\.+*?()|\\[\\]{}^$]" s "\\\\$0"))
+
+(define (dry-run config bucket key wasm-bytes nfiles size project d)
+  (let ((t (getenv "CLOUDFLARE_API_TOKEN")) (a (getenv "CLOUDFLARE_ACCOUNT_ID")))
+    (if (and t (not (equal? t "")) a (not (equal? a "")))
+        (let ((cred (resolve-credentials config)))
+          (let ((rc (guard (e ((refusal? e)
+                               (eprintln "~a" (redact cred (refusal-message e)))
+                               (refuse "dry run: the token cannot read ~a (it cannot publish either)" bucket)))
+                      (r2-head cred bucket key))))
+            (say "dry run: R2 read-only check: ~a/~a is ~a (the token reads the bucket)"
+                 bucket key (if (= rc 0) "already there" "absent"))))
+        (say "dry run: CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID not set, so R2 was not checked (a dry run reads no pass entry)")))
+  (say "dry run: would put ~a (~a bytes) in R2 bucket ~a (R2's S3 API), read it back and compare" key wasm-bytes bucket)
+  (say "dry run: would deploy ~a files (~a) plus functions/ from ~a to Pages project ~a: branch ~a, verify-live on its URL~a"
+       nfiles (car (split size "\t")) d project (cfg config "publish" "pages" "preview-branch")
+       (if only-preview "" (str ", then branch " (cfg config "publish" "pages" "production-branch") " and verify-live again")))
+  (say "dry run: nothing was written anywhere")
+  0)
+
+(define (live config root dir dir-arg manifest head bucket key wasm-file back d home project want-nowasm wj-sha)
+  (require-tools! '("wrangler" "curl" "chmod"))
+  (let ((cred (resolve-credentials config)))
+    ;; a read of the wasm's key: 0 there, 3 absent; any other answer is a
+    ;; refusal, so a refused or failed read is never taken as "absent, put it"
+    (define (r2-read)
+      (guard (e ((refusal? e)
+                 (refuse "could not read ~a/~a (~a: refused or failed, not absent); nothing deployed"
+                         bucket key (redact cred (refusal-message e)))))
+        (r2-get cred bucket key back)))
+    (define (deploy branch)
+      (let ((got (guard (e ((refusal? e) (refuse "tree-manifest refused the deploy directory: ~a" (refusal-message e))))
+                   (string-join (tree-manifest (path d "tree") d) "\n"))))
+        (unless (equal? got want-nowasm)
+          (refuse "the deploy directory changed after it was checked; nothing deployed to ~a" branch)))
+      (unless (equal? (file-sha256 (path d "wrangler.json")) wj-sha)
+        (refuse "wrangler.json in the deploy directory changed; nothing deployed to ~a" branch))
+      (let* ((r ($? wrangler pages deploy tree --project-name ,project --branch ,branch
+                    --commit-hash ,head --commit-message ,message
+                    cwd: ,d
+                    env: ,(append (credential-env cred)
+                                  (list (cons "HOME" home) (cons "XDG_CONFIG_HOME" home)
+                                        (cons "WRANGLER_SEND_METRICS" "false")))
+                    err: 'merge
+                    timeout: 1800))
+             (log (redact cred (stdout-of r))))
+        (display log)
+        (unless (ok? r)
+          (refuse "wrangler pages deploy to ~a failed (~a)" branch
+                  (if (timed-out? r) "timed out after 1800 s" (str "rc=" (exit-status r)))))
+        ;; the FIRST pages.dev URL wrangler prints is this deployment's own;
+        ;; the last is the branch alias, whose edge cache can still serve an
+        ;; older deployment's files. Verify the deployment itself.
+        (let ((m (regex-search "https://[a-z0-9.-]*\\.pages\\.dev" log)))
+          (unless m
+            (refuse "the deploy to ~a printed no pages.dev URL; check it by hand: sgx substratic:verify-live <url> ~a"
+                    branch dir-arg))
+          (match-group m 0))))
+    (define (verify url what)
+      (let ((v ($? node ,(path tasks-dir "checks" "verify-live.mjs") ,url ,dir timeout: 900)))
+        (display (stdout-of v))
+        (unless (ok? v)
+          (refuse "the ~a FAILED verify-live~a" what (if (equal? what "preview") "; production NOT deployed" "")))))
+
+    (let ((rc (r2-read)))
+      (if (= rc 0)
+          (say "~a is already in ~a" key bucket)
+          (begin
+            (guard (e ((refusal? e)
+                       (refuse "the R2 upload failed (~a); nothing deployed" (redact cred (refusal-message e)))))
+              (r2-put cred bucket key wasm-file "application/wasm"))
+            (unless (= (r2-read) 0)
+              (refuse "the R2 read-back found no object at ~a/~a; nothing deployed" bucket key))
+            (say "put ~a (~a bytes)" key (file-size wasm-file)))))
+    (unless (ok? ($? cmp -s ,wasm-file ,back))
+      (refuse "the object at ~a/~a is not the verified wasm; nothing deployed" bucket key))
+    (say "R2 holds the verified wasm at ~a (read back, identical)" key)
+    (let ((url (deploy (cfg config "publish" "pages" "preview-branch"))))
+      (say "preview deployed to ~a; checking it against ~a.manifest" url dir-arg)
+      (verify url "preview")
+      (if only-preview
+          (say "preview only: ~a (verify-live green); the game is at ~a/~a/" url url (manifest-header-ref manifest "game"))
+          (let ((url (deploy (cfg config "publish" "pages" "production-branch"))))
+            (say "production deployed to ~a; checking it against ~a.manifest" url dir-arg)
+            (verify url "production")
+            (say "production green at ~a" url))))
+    0))
+
+(exit (with-refusals publish))

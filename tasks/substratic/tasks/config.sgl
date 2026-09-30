@@ -1,0 +1,386 @@
+;;; (substratic tasks config) - a game's substratic.sgv, read as data.
+;;;
+;;; The file is Sigil syntax read with `read`, never evaluated, so
+;;; `(pass "cloudflare/x-site")` is a description the tools interpret, not a
+;;; call. Its first form is the header `(substratic schema: 1)`; then one
+;;; form per section. Only `(publish ...)` exists today.
+;;;
+;;; STRICT on purpose (a tolerant reader downgrades silently): an unknown
+;;; section, an unknown key, a repeated key or a value of the wrong shape is
+;;; a refusal naming the file and the key, so an older substratic refuses a
+;;; newer file loudly instead of ignoring what it does not understand. Every
+;;; value that reaches a URL, a file name, a header or generated code is
+;;; checked against a whitelist here, once.
+;;;
+;;; The (publish ...) section:
+;;;
+;;;   credentials: (pass "cloudflare/NAME-site")     where the token lives
+;;;   pages: (project: "NAME" production-branch: "master"
+;;;           preview-branch: "preview" domains: ("a.net" "www.a.net")
+;;;           zone: "a.net" compatibility-date: "2026-07-14")
+;;;   wasm: (bucket: "NAME-wasm" binding: "WASM" route: "w")
+;;;           route: the wasm's directory under the site root; the key in R2
+;;;           and the path served are ROUTE/<sha16>/<app>.wasm
+;;;   apps: ((name: "game"                           the wasm is <name>.wasm
+;;;           web: (dir: "build/web" env: "GAME_WEB_DIR")
+;;;           mount: "play"          or (env: "V" file: "~/f" default: "beta"
+;;;                                      pattern: "[a-z][a-z0-9-]{1,31}")
+;;;           requires: ("assets/x")))               more files the build must have
+;;;   indexing: noindex                              or index (public: robots allow
+;;;                                                  all, only 404.html says noindex)
+;;;   site: (source: "site" files: ("index.html" ...))   copy exactly these, or
+;;;   site: (source: "site" copy: tracked required: (...) refuse: ("news" ...))
+;;;           every git-tracked file under source:; refuse: names that must not
+;;;           be in source: (generated or staged paths)
+;;;   stage-hook: (argv: ("node" "scripts/x.mjs" "{dir}" "--version" "{version}"
+;;;                       "--stamp" "{stamp}")
+;;;                outputs: ("version.json") inputs: ("news"))
+;;;           run after the copy; must write outputs: under DIR; inputs: must be
+;;;           non-empty and hold no untracked file
+;;;   wasm: (... noindex: yes)                       the Function's own robots
+;;;                                                  header (default: indexing:)
+;;;   check: (arm: "scripts/check-boots.mjs" gate-files: ("scripts/shot-web.mjs"))
+;;;   host: (https: 8811 http: 8812 dir: "~/somewhere" interface: "wg0")
+;;;   remote: (web-config: web)
+
+(define-library (substratic tasks config)
+  (import (sigil shell prelude) (sigil list) (substratic tasks common))
+  (export read-config
+          config-path
+          cfg
+          cfg-opt
+          publish-app
+          resolve-mount
+          resolve-web-dir
+          pass-entry)
+  (begin
+
+    (define config-name "substratic.sgv")
+
+    (define (config-path root) (path root config-name))
+
+    ;; ---- reading keyword lists strictly
+
+    (define (key-name k) (keyword->string k))
+
+    ;; LST as (key: value key: value ...) -> alist of ("key" . value).
+    ;; Every key must be in ALLOWED; none may repeat; WHERE names the place
+    ;; for the refusal.
+    (define (keyword-list lst allowed where)
+      (unless (list? lst)
+        (refuse "~a: ~a must be a list of key: value pairs" config-name where))
+      (let loop ((xs lst) (acc '()))
+        (cond ((null? xs) (reverse acc))
+              ((not (keyword? (car xs)))
+               (refuse "~a: ~a: expected a key: here, found ~s" config-name where (car xs)))
+              ((null? (cdr xs))
+               (refuse "~a: ~a: ~a: has no value" config-name where (key-name (car xs))))
+              (else
+               (let ((k (key-name (car xs))))
+                 (unless (member k allowed)
+                   (refuse "~a: ~a: unknown key ~a: (known: ~a)" config-name where k
+                           (string-join allowed ", ")))
+                 (when (assoc k acc)
+                   (refuse "~a: ~a: ~a: given twice" config-name where k))
+                 (loop (cddr xs) (cons (cons k (cadr xs)) acc)))))))
+
+    (define (need al k where)
+      (let ((p (assoc k al)))
+        (unless p (refuse "~a: ~a: missing ~a:" config-name where k))
+        (cdr p)))
+
+    ;; ---- value checks
+
+    (define (check-string v pattern what where)
+      (unless (and (string? v) (one-line? v) (regex-match? pattern v))
+        (refuse "~a: ~a: ~a must be a string matching ~a, found ~s" config-name where what pattern v))
+      v)
+
+    (define (check-strings vs pattern what where)
+      (unless (and (list? vs) (pair? vs))
+        (refuse "~a: ~a: ~a must be a non-empty list of strings" config-name where what))
+      (map (lambda (v) (check-string v pattern what where)) vs))
+
+    (define (check-port v what where)
+      (unless (and (integer? v) (> v 1023) (< v 65536))
+        (refuse "~a: ~a: ~a must be a port number 1024-65535, found ~s" config-name where what v))
+      v)
+
+    ;; a path inside the project: relative, no . or .. segments
+    (define rel-path "[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+    (define (check-rel v what where)
+      (check-string v rel-path what where)
+      (when (regex-search "(^|/)\\.\\.?(/|$)" v)
+        (refuse "~a: ~a: ~a must stay inside the project, found ~s" config-name where what v))
+      v)
+
+    (define name-pat "[a-z0-9][a-z0-9-]{0,62}")
+    (define env-pat "[A-Z_][A-Z0-9_]{0,63}")
+    (define home-path "(~/)?[A-Za-z0-9_./-]+")
+
+    ;; ---- the sections
+
+    (define (read-credentials v where)
+      (unless (and (list? v) (= (length v) 2) (eq? (car v) 'pass))
+        (refuse "~a: ~a: credentials: must be (pass \"cloudflare/NAME-site\"), found ~s" config-name where v))
+      (let ((entry (check-string (cadr v) "[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)*" "the pass entry" where)))
+        (when (contains? entry "..")
+          (refuse "~a: ~a: the pass entry may not contain ..: ~s" config-name where entry))
+        (list (cons "pass" entry))))
+
+    (define (read-pages v where)
+      (let ((al (keyword-list v '("project" "production-branch" "preview-branch"
+                                  "domains" "zone" "compatibility-date")
+                              where)))
+        (list (cons "project" (check-string (need al "project" where) name-pat "project:" where))
+              (cons "production-branch"
+                    (check-string (need al "production-branch" where) "[a-z0-9][a-z0-9-]{0,30}" "production-branch:" where))
+              (cons "preview-branch"
+                    (let ((p (check-string (need al "preview-branch" where) "[a-z0-9][a-z0-9-]{0,30}" "preview-branch:" where)))
+                      ;; the preview would otherwise BE production, before verify-live ran
+                      (when (equal? p (need al "production-branch" where))
+                        (refuse "~a: ~a: preview-branch: is the production branch" config-name where))
+                      p))
+              (cons "domains" (check-strings (need al "domains" where) "[a-z0-9-]+(\\.[a-z0-9-]+)+" "domains:" where))
+              (cons "zone" (check-string (need al "zone" where) "[a-z0-9-]+(\\.[a-z0-9-]+)+" "zone:" where))
+              (cons "compatibility-date"
+                    (check-string (need al "compatibility-date" where) "20[0-9]{2}-[01][0-9]-[0-3][0-9]" "compatibility-date:" where)))))
+
+    (define (read-wasm v where)
+      (let ((al (keyword-list v '("bucket" "binding" "route" "noindex") where)))
+        (list (cons "bucket" (check-string (need al "bucket" where) "[a-z0-9][a-z0-9-]{1,62}" "bucket:" where))
+              (cons "binding" (check-string (need al "binding" where) "[A-Z][A-Z0-9_]{0,31}" "binding:" where))
+              (cons "route" (check-string (need al "route" where) "[a-z0-9-]+(/[a-z0-9-]+)*" "route:" where))
+              ;; whether the wasm's Function says X-Robots-Tag: noindex; unset,
+              ;; it follows indexing: (a binary is never a page to index)
+              (cons "noindex" (let ((p (assoc "noindex" al)))
+                                (cond ((not p) #f)
+                                      ((memq (cdr p) '(yes no)) (symbol->string (cdr p)))
+                                      (else (refuse "~a: ~a: noindex: must be yes or no, found ~s" config-name where (cdr p)))))))))
+
+    (define (read-mount v where)
+      (cond ((string? v) (check-string v "[a-z][a-z0-9-]{0,31}" "mount:" where))
+            (else
+             (let ((al (keyword-list v '("env" "file" "default" "pattern") where)))
+               (list 'variable
+                     (cons "env" (check-string (need al "env" where) env-pat "mount: env:" where))
+                     (cons "file" (check-string (need al "file" where) home-path "mount: file:" where))
+                     (cons "default" (check-string (need al "default" where) "[a-z][a-z0-9-]{0,31}" "mount: default:" where))
+                     (cons "pattern" (let ((p (need al "pattern" where)))
+                                       (unless (string? p)
+                                         (refuse "~a: ~a: mount: pattern: must be a string" config-name where))
+                                       ;; compile it now: a bad pattern is the file's fault
+                                       (guard (e ((regex-error? e)
+                                                  (refuse "~a: ~a: mount: pattern: ~a" config-name where
+                                                          (error-object-message e))))
+                                         (regex p))
+                                       p)))))))
+
+    (define (read-app v where)
+      (let* ((al (keyword-list v '("name" "web" "mount" "requires") where))
+             (web (keyword-list (need al "web" where) '("dir" "env") (str where " web:"))))
+        (list (cons "name" (check-string (need al "name" where) name-pat "name:" where))
+              (cons "web-dir" (check-rel (need web "dir" where) "web: dir:" where))
+              (cons "web-env" (let ((p (assoc "env" web)))
+                                (and p (check-string (cdr p) env-pat "web: env:" where))))
+              (cons "mount" (read-mount (need al "mount" where) where))
+              (cons "requires" (let ((p (assoc "requires" al)))
+                                 (if p (map (lambda (f) (check-rel f "requires:" where)) (cdr p)) '()))))))
+
+    (define (read-apps v where)
+      (unless (and (list? v) (pair? v))
+        (refuse "~a: ~a: apps: must be a list of (name: ...) entries" config-name where))
+      (unless (= (length v) 1)
+        (refuse "~a: ~a: apps: has ~a entries; these tools serve one app per site so far"
+                config-name where (length v)))
+      (map (lambda (a) (read-app a (str where " apps:"))) v))
+
+    (define (rel-list al k where)
+      (let ((p (assoc k al)))
+        (cond ((not p) '())
+              ((list? (cdr p)) (map (lambda (f) (check-rel f (str k ":") where)) (cdr p)))
+              (else (refuse "~a: ~a: ~a: must be a list of paths" config-name where k)))))
+
+    ;; copy: listed (default) copies exactly files:; copy: tracked copies every
+    ;; git-tracked file under source: and requires required:. refuse: names
+    ;; that must not exist in source: (the tree's generated or staged paths).
+    (define (read-site v where)
+      (let* ((al (keyword-list v '("source" "copy" "files" "required" "refuse") where))
+             (copy (let ((p (assoc "copy" al)))
+                     (cond ((not p) "listed")
+                           ((memq (cdr p) '(listed tracked)) (symbol->string (cdr p)))
+                           (else (refuse "~a: ~a: copy: must be listed or tracked, found ~s" config-name where (cdr p)))))))
+        (when (and (equal? copy "listed") (null? (rel-list al "files" where)))
+          (refuse "~a: ~a: files: must be a non-empty list (copy: listed)" config-name where))
+        (when (and (equal? copy "tracked") (assoc "files" al))
+          (refuse "~a: ~a: files: is for copy: listed; copy: tracked takes required:" config-name where))
+        (list (cons "source" (check-rel (need al "source" where) "source:" where))
+              (cons "copy" copy)
+              (cons "files" (rel-list al "files" where))
+              (cons "required" (rel-list al "required" where))
+              (cons "refuse" (rel-list al "refuse" where)))))
+
+    ;; a program the stage runs after copying: argv (with {dir}, {version},
+    ;; {stamp} replaced), the files it must have written under DIR, and the
+    ;; directories it reads, which must be non-empty and hold no untracked file
+    (define (read-stage-hook v where)
+      (let* ((al (keyword-list v '("argv" "outputs" "inputs") where))
+             (argv (need al "argv" where)))
+        (unless (and (list? argv) (pair? argv)
+                     (null? (filter (lambda (a) (not (and (string? a) (one-line? a) (not (regex-search "[\\x00-\\x1f]" a))))) argv)))
+          (refuse "~a: ~a: argv: must be a non-empty list of one-line strings" config-name where))
+        (list (cons "argv" argv)
+              (cons "outputs" (let ((o (rel-list al "outputs" where)))
+                                (when (null? o) (refuse "~a: ~a: outputs: names nothing to check" config-name where))
+                                o))
+              (cons "inputs" (rel-list al "inputs" where)))))
+
+    (define (read-check v where)
+      (let ((al (keyword-list v '("arm" "gate-files") where)))
+        (list (cons "arm" (check-rel (need al "arm" where) "arm:" where))
+              (cons "gate-files" (let ((p (assoc "gate-files" al)))
+                                   (if p (map (lambda (f) (check-rel f "gate-files:" where)) (cdr p)) '()))))))
+
+    (define (read-host v where)
+      (let ((al (keyword-list v '("https" "http" "dir" "interface") where)))
+        (list (cons "https" (check-port (need al "https" where) "https:" where))
+              (cons "http" (check-port (need al "http" where) "http:" where))
+              (cons "dir" (check-string (need al "dir" where) home-path "dir:" where))
+              ;; the network interface host-site binds to (its one IPv4 address);
+              ;; only host-site needs it, and it refuses without one
+              (cons "interface" (let ((p (assoc "interface" al)))
+                                  (and p (check-string (cdr p) "[A-Za-z0-9._-]{1,15}" "interface:" where)))))))
+
+    (define (read-remote v where)
+      (let ((al (keyword-list v '("web-config") where)))
+        (let ((c (need al "web-config" where)))
+          (unless (and (symbol? c) (regex-match? "[a-z][a-z0-9-]*" (symbol->string c)))
+            (refuse "~a: ~a: web-config: must be a config name, found ~s" config-name where c))
+          (list (cons "web-config" (symbol->string c))))))
+
+    (define (read-indexing v where)
+      (unless (memq v '(noindex index))
+        (refuse "~a: ~a: indexing: must be noindex or index, found ~s" config-name where v))
+      (symbol->string v))
+
+    (define (read-publish body)
+      (let* ((where "(publish ...)")
+             (al (keyword-list body '("credentials" "pages" "wasm" "apps" "indexing"
+                                      "site" "stage-hook" "check" "host" "remote")
+                               where))
+             (opt (lambda (k reader)
+                    (let ((p (assoc k al)))
+                      (if p (reader (cdr p) (str where " " k ":")) #f)))))
+        (list (cons "credentials" (read-credentials (need al "credentials" where) where))
+              (cons "pages" (read-pages (need al "pages" where) (str where " pages:")))
+              (cons "wasm" (read-wasm (need al "wasm" where) (str where " wasm:")))
+              (cons "apps" (read-apps (need al "apps" where) where))
+              (cons "indexing" (read-indexing (need al "indexing" where) where))
+              (cons "site" (read-site (need al "site" where) (str where " site:")))
+              (cons "stage-hook" (opt "stage-hook" read-stage-hook))
+              (cons "check" (opt "check" read-check))
+              (cons "host" (opt "host" read-host))
+              (cons "remote" (opt "remote" read-remote)))))
+
+    ;; Every form in the file, read without evaluating anything.
+    (define (read-forms file)
+      (call-with-input-file file
+        (lambda (port)
+          (let loop ((acc '()))
+            (let ((x (read port)))
+              (if (eof-object? x) (reverse acc) (loop (cons x acc))))))))
+
+    ;; ROOT's substratic.sgv -> an alist: ("schema" . 1) ("publish" . ALIST).
+    (define (read-config root)
+      (let ((file (config-path root)))
+        (unless (file? file)
+          (refuse "~a is missing: the game's Substratic configuration (see substratic's tasks/README.md)" file))
+        (let ((forms (guard (e ((error-object? e)
+                                (refuse "~a does not read as data: ~a" file (error-object-message e))))
+                       (read-forms file))))
+          (when (null? forms) (refuse "~a is empty" file))
+          (let ((header (car forms)))
+            (unless (and (list? header) (eq? (car header) 'substratic))
+              (refuse "~a: the first form must be (substratic schema: 1), found ~s" file header))
+            (let ((h (keyword-list (cdr header) '("schema") "(substratic ...)")))
+              (unless (equal? (need h "schema" "(substratic ...)") 1)
+                (refuse "~a: schema ~s; these tools read schema 1 (a newer substratic?)" file
+                        (need h "schema" "(substratic ...)")))))
+          (let loop ((fs (cdr forms)) (acc (list (cons "schema" 1))))
+            (cond ((null? fs) (reverse acc))
+                  ((not (and (pair? (car fs)) (symbol? (caar fs))))
+                   (refuse "~a: expected a (section ...) form, found ~s" file (car fs)))
+                  ((assoc (symbol->string (caar fs)) acc)
+                   (refuse "~a: (~a ...) appears twice" file (caar fs)))
+                  ((eq? (caar fs) 'publish)
+                   (loop (cdr fs) (cons (cons "publish" (read-publish (cdar fs))) acc)))
+                  (else
+                   (refuse "~a: unknown section (~a ...); these tools know (publish ...) (a newer substratic?)"
+                           file (caar fs))))))))
+
+    ;; (cfg config "publish" "pages" "project") -> the value, or a refusal
+    ;; naming the missing section.
+    (define (cfg al . keys)
+      (let loop ((v al) (ks keys) (seen '()))
+        (cond ((null? ks) v)
+              (else
+               (let ((p (and (list? v) (assoc (car ks) v))))
+                 (unless (and p (cdr p))
+                   (refuse "~a: no ~a (needed here)" config-name
+                           (string-join (reverse (cons (car ks) seen)) " ")))
+                 (loop (cdr p) (cdr ks) (cons (car ks) seen)))))))
+
+    (define (cfg-opt al . keys)
+      (let loop ((v al) (ks keys))
+        (cond ((null? ks) v)
+              ((not (list? v)) #f)
+              (else (let ((p (assoc (car ks) v))) (and p (cdr p) (loop (cdr p) (cdr ks))))))))
+
+    (define (publish-app config) (car (cfg config "publish" "apps")))
+
+    (define (pass-entry config) (cfg config "publish" "credentials" "pass"))
+
+    ;; The app's web build: $ENV when set and non-empty, else web: dir:,
+    ;; relative to ROOT unless absolute.
+    (define (resolve-web-dir app root)
+      (let* ((env (cdr (assoc "web-env" app)))
+             (v (and env (getenv env)))
+             (d (if (and v (not (equal? v ""))) v (cdr (assoc "web-dir" app)))))
+        (if (starts-with? d "/") d (path root d))))
+
+    ;; The app's path under the site root, checked. A fixed mount is itself;
+    ;; a variable one is $ENV, else the file's first line, else the default,
+    ;; and must match its pattern. It may not be the wasm route's first
+    ;; segment.
+    (define (resolve-mount app wasm-route)
+      (let* ((m (cdr (assoc "mount" app)))
+             (v (if (string? m)
+                    m
+                    (let* ((al (cdr m))
+                           (env-v (getenv (cdr (assoc "env" al))))
+                           (file (expand-home (cdr (assoc "file" al))))
+                           (file-v (and (or (not env-v) (equal? env-v ""))
+                                        (file? file)
+                                        (read-text file trim: #f)))
+                           (chosen (cond ((and env-v (not (equal? env-v ""))) env-v)
+                                         ((and file-v (not (equal? (strip-newlines file-v) "")))
+                                          (strip-newlines file-v))
+                                         (else (cdr (assoc "default" al))))))
+                      ;; the game's pattern, AND a plain name whatever the pattern
+                      ;; allows: the mount becomes a path under DIR
+                      (unless (and (one-line? chosen)
+                                   (regex-match? "[a-z][a-z0-9-]{0,31}" chosen)
+                                   (regex-match? (cdr (assoc "pattern" al)) chosen))
+                        (refuse "the game's path '~a' does not match ~a" chosen (cdr (assoc "pattern" al))))
+                      chosen)))
+             (first-seg (car (split wasm-route "/"))))
+        (when (equal? v first-seg)
+          (refuse "the game's path '~a' is the wasm's route /~a/" v wasm-route))
+        v))
+
+    ;; what $(cat f) does: drop trailing newlines only
+    (define (strip-newlines s)
+      (let loop ((n (string-length s)))
+        (if (and (> n 0) (memv (string-ref s (- n 1)) '(#\newline #\return)))
+            (loop (- n 1))
+            (substring s 0 n))))))
