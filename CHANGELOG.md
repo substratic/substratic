@@ -1,17 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-09-30)
 
-- `tasks/`: the games' site tooling, shared, in Sigil shell: `build-remote`,
-  `stage-web`, `check-site`, `publish-web`, `verify-live`, `pages-dev-check`,
-  `cloudflare-setup`, `host-site`, `tree-manifest` and `r2-s3`. A game
-  configures them in a `substratic.sgv` at its root (read as data; an
-  unknown key is refused) and runs them as `sgx substratic:<task>` from
-  Sigil 0.22.11, or by path before that. They generate the Pages Function
-  and `wrangler.json`, take the Cloudflare token from the environment or
-  from the pass entry the config names, never delete anything remote, and
-  never pass a credential on a command line. `tasks/README.md` has the path
-  from a commit to the site. Nothing in `tasks/` is compiled into a game.
+- `tasks/`: a game's whole path from a commit to its site and its downloads,
+  as script tasks in Sigil shell, run as `sgx substratic:<task>` (or
+  `sigil task substratic:<task>`) from a game that lists `substratic`.
+  Nothing in `tasks/` is compiled into a game.
+  - Site: `build-remote` (a web build of exactly HEAD on a remote runner),
+    `stage-web`, `check-site` (the local gate, plus the game's own legs),
+    `publish-web` (R2, then a preview checked live, then production),
+    `verify-live`, `pages-dev-check`, `cloudflare-setup`, `host-site`,
+    `tree-manifest` and `r2-s3`.
+  - Downloads: `check-linux-binary` and `make-portable` (a Linux
+    executable that starts off the machine that built it), `smoke-ubuntu`
+    (runs a release in a stock Ubuntu 22.04 userland, no root) and
+    `distro-play` (plays an archive in Ubuntu, Fedora, Debian or Arch).
+- A game configures them in `substratic.sgv` at its root, read as data
+  and never evaluated; an unknown section or key is refused.
+- The tools generate the Pages Function and `wrangler.json`, take the
+  Cloudflare token from the environment or from the `pass` entry the
+  config names, never put a credential on a command line or in a file,
+  never delete anything remote, and refuse to publish anything but the
+  tree their own gate checked, at HEAD, from a clean checkout.
+- Substratic needs Sigil 0.22.11 (`sigil task`); its lock is on 0.22.11.
 
 ## 0.2.3 (2026-09-29)
 
